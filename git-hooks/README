@@ -13,3 +13,5 @@ Current hooks:
     - pre-commit:
         - Fixes any trailing whitespace issue. This will reduce the number of fake
           differences
+    - commit-msg:
+        - Adds the ID line required by Gerrit
