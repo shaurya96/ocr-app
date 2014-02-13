@@ -1,0 +1,774 @@
+#!/usr/bin/python
+
+import logging, os, shlex, subprocess, tempfile
+from datetime import datetime, timedelta
+from junit_xml import TestCase, TestCasesFile, TestSuite
+from string import Template
+
+
+class Dependence(object):
+    """Convenience class to describe a dependence between
+       two jobs
+    """
+    UNKNOWN = 0x0
+    SUCCESS = 0x1
+    FAIL    = 0x3
+
+    def __init__(self, job, slot):
+        """Initializes a dependence. The 'slot'
+           parameter is the dependence slot on the
+           destination job and the 'job' parameter is
+           the source job (what the dependence is waiting
+           on)
+        """
+        # Public variables
+        self.job = job
+        self.slot = slot
+
+        # Private variables
+        self._status = Dependence.UNKNOWN
+
+    def setStatus(self, status):
+        self._status = status
+
+    def getStatus(self):
+        return self._status
+
+    def isCleared(self):
+        """Returns True if the dependence has been met
+           This is very simple for now but in the future,
+           we may want to include things like ignore failure, etc
+        """
+        return self._status == Dependence.SUCCESS
+
+    def isUnknown(self):
+        """Returns True if the dependence is still being
+           evaluated
+        """
+        return self._status == Dependence.UNKNOWN
+
+class JobTypeObject(object):
+    """Describes a job type to be run. A job type
+       describes a set of jobs
+    """
+    def __init__(self, inputDict):
+        """Creates a new job type. The parameters are:
+               - inputDict is a dictionary with 'name', 'keywords', 'isLocal', 
+                 'run-cmd', 'param-cmd', 'sandbox' and optionally 'timeout'
+        """
+        # Public variables (to avoid getter/setter)
+        self.name = inputDict['name']
+        self.keywords = inputDict['keywords']
+        self.isLocal = inputDict['isLocal']
+        self.run_cmd = inputDict['run-cmd']
+        self.param_cmd = inputDict['param-cmd']
+        self.sandbox = inputDict['sandbox']
+        self.timeout = inputDict.get('timeout', 0) # Defaults to 0
+
+        self._myLog = logging.getLogger()
+
+        # Check the sandbox keywords
+        cleanSandbox = []
+        for val in self.sandbox:
+            if val in ('createRoot', 'shareOK', 'single', 'local', 'shared'):
+                cleanSandbox.append(val)
+            else:
+                self._myLog.warning("%s specifies invalid sandbox parameter '%s'... ignoring" % (str(self), val))
+        if len(cleanSandbox) <> len(self.sandbox):
+            self.sandbox = tuple(cleanSandbox)
+
+    def __repr__(self):
+        # TODO: Put more detail
+        return self.__str__()
+
+    def __str__(self):
+        return "<JobType '%s'>" % (self.name)
+
+
+class JobObject(object):
+    """Describes a job to be run. Each job will contain
+        - The attributes required to run the job
+        - A set of dependences that must be met
+    """
+    UNCONFIGURED_JOB = 0x0 # JobObject is not configured yet
+    WAITING_JOB      = 0x1 # JobObject is waiting for the status of some of its dependences
+    READY_JOB        = 0x10 # JobObject is ready to run (all dependence satisfied and cleared)
+    BLOCKED_JOB      = 0x11 # JobObject will never be ready because a dependence failed
+    RUNNING_LOCAL    = 0x20 # JobObject is runnning locally
+    RUNNING_REMOTE   = 0x21 # JobObject is running over a job manager
+    DONE_OK          = 0x40 # JobObject completed and returned a status of 0
+    DONE_FAIL_LAUNCH = 0x41 # JobObject failed to launch
+    DONE_FAIL_TIMEOUT= 0x42 # JobObject failed due to a time-out
+    DONE_FAIL_STATUS = 0x43 # JobObject ran and completed with a non-zero status
+    
+    @classmethod
+    def setGlobals(cls, **globals):
+        for k, v in globals.iteritems():
+            setattr(cls, k, v)
+
+    def __init__(self, inputDict, jobType, dependenceCount):
+        """Create a new job. The parameters are:
+            - inputDict is a dictionary with 'name', 'run-args',
+              and optionally 'sandbox' and 'timeout'
+            - jobType is an object of type JobTypeObject
+            - dependenceCount is the number of dependences
+        """
+
+        # Public variables (to avoid getter/setter)
+        self.name = inputDict['name']
+        self.run_args = inputDict['run-args']
+        self.param_args = inputDict.get('param-args', "")
+        self.timeout = inputDict.get('timeout', None)
+        self.jobType = jobType
+        
+        # These three variables are used when the process starts running
+        self._outFile = None    # Out file to be used when this job executes
+        self._errFile = None    # Err file to be used when this job executes
+        self._process = None    # sub-process executing this job
+        self._startTime = None  # Time the process started running
+        self._endTime   = None  # Time the process ended running
+        
+        # Private variables
+
+        # First the rest of the configuration variables
+        self._sandbox = inputDict.get('sandbox', ())
+
+        # The logger (for now use the same global one)
+        self._myLog = logging.getLogger()
+
+        # Dependence stuff
+        self._waiters = dict() # Key is name, value is pair of job and slot
+        self._dependence = [None] * dependenceCount  # List of jobs that we depend on
+        self._lastDependenceSet = 0
+        self._depth = 0
+
+        self._sharedRootDirectory = None  # Name of the root directory for this job
+                                          # that is shared with LUSTRE
+        self._privateRootDirectory = None # Name of the root directory for this job that is
+                                          # private to the machine
+
+        # Place where we put the result
+        self._testSuite = TestSuite(self.name)
+
+        # Status variables
+        if dependenceCount == 0:
+            self._jobStatus = JobObject.READY_JOB
+            # Do not add to ready job since the depth may not be accurate
+        else:
+            self._jobStatus = JobObject.UNCONFIGURED_JOB
+
+        self._recomputeStatus = False # True if status needs to be updated
+        self._recomputeDirs = True    # True if _dirs needs to be updated
+        self._dirs = {'private': None, 'shared': None, 
+                      'copy-private': None, 'copy-shared': None,} # Cached directory information
+
+        # Variables used to determine how to build the directories
+        self._shareOK = False
+        self._wholeMachine = False
+        # For the next two variables: -2 (no directory), -1 (clean/original directory), any
+        # other number, the dependence from which we inherit the directory
+        self._requireSharedRoot = -2  # Do not require a shared root
+        self._requirePrivateRoot = -2 # Do not require a private root
+        self._startInShared = False
+        self._newDirectory = False # Will be true if a new directory needs to be created
+
+        # Very simple propagation of values
+        if self._sandbox is None:
+            self._sandbox = jobType.sandbox
+        else:
+            self._sandbox = jobType.sandbox + self._sandbox
+        if self.timeout is None:
+            self.timeout = jobType.timeout
+
+        # Parse the sandbox information
+        self._parseSandbox()        
+
+        self._myLog.debug("Created a JobObject for %s" % (str(self)))
+
+    def addWaiter(self, waiterJob, slot):
+        """Adds a job to the waiters list. That waiting
+           job will be notified when this job completes
+           (either successfully or not).
+           Returns False is the waiter was NOT added
+           and True otherwise
+        """
+        assert(waiterJob.name not in self._waiters)
+        # Check if we are already all done
+        if self._recomputeStatus:
+            self._updateStatus()
+        assert(self._recomputeStatus == False)
+        if self._jobStatus & 0x40:
+            # We already have run the job and everything we
+            # don't add the waiter
+            return False
+        self._waiters[waiterJob.name] = (waiterJob, slot)
+        self._myLog.debug("Added %s as a waiter to %s; now have %d waiters" %
+                         (str(waiterJob), str(self), len(self._waiters)))
+        if self._depth < waiterJob._depth + 1:
+            self._depth = waiterJob._depth + 1
+            self._propagateDepthInfo()
+        self._myLog.debug("%s now has depth %d" % (str(self), self._depth))
+        return True
+    
+    def addDependence(self, signalingJob):
+        """Adds a job to the list of dependence.
+           Returns the slot used for this dependence
+        """
+        assert(self._lastDependenceSet < len(self._dependence))
+        self._dependence[self._lastDependenceSet] = Dependence(signalingJob, 
+                                                               self._lastDependenceSet)
+        self._myLog.debug("%s depends on %s at slot %d" % (
+            str(self), str(signalingJob), self._lastDependenceSet))
+        self._lastDependenceSet += 1
+        self._recomputeStatus = True # Status will need to be recomputed
+        return self._lastDependenceSet - 1
+        
+    def satisfyDependence(self, signalingJob, slot):
+        """Notifies this job that a dependence is satisfied"""
+        self._myLog.debug("Satisfying dependence slot %d of %s with %s" % (slot, str(self), str(signalingJob)))
+        assert(self._dependence[slot].job == signalingJob)
+        
+        self._dependence[slot].setStatus((Dependence.SUCCESS if signalingJob.getStatus() == JobObject.DONE_OK else Dependence.FAIL))
+        self._recomputeStatus = True
+        self._updateStatus()
+        if self._jobStatus == JobObject.READY_JOB:
+            # We can move ourself to the ready queue
+            self._myLog.debug("Satisfaction triggered %s" % (str(self)))
+        elif self._jobStatus == JobObject.BLOCKED_JOB:
+            self._myLog.warning("%s is BLOCKED due to failure in %s" % (str(self), str(signalingJob)))
+
+            # We note a failure test case and record the "path" it took us to get here
+            testCase = TestCase("_main_" + self.name, self.name, 0, '', '')
+            testCase.add_error_info("JobObject was not run due to a dependence failure", '')
+            self._testSuite.add_test_case(testCase)
+            for dep in self._dependence:
+                self._testSuite.merge_cases(dep.job._testSuite)
+
+            # Inform the jobs dependending on us
+            for v in self._waiters.itervalues():
+                v[0].satisfyDependence(self, v[1])
+
+    def updateDepth(self, depth):
+        """Updates the depth to be the maximum of 'depth'
+           and 'self.depth'
+        """
+        if depth > self._depth:
+            self._depth = depth
+            self._propagateDepthInfo()
+            
+    def getDepth(self):
+        """Returns the depth"""
+        return self._depth
+
+    def getStatus(self):
+        """Returns the status of this job (ready, un-runnable, etc"""
+        if self._recomputeStatus:
+            self._updateStatus()
+        assert(not self._recomputeStatus)
+        return self._jobStatus
+    
+    def getIsWholeMachine(self):
+        """Returns true if this job requires the entire local machine"""
+        return self._wholeMachine
+
+    def getIsTerminalJob(self):
+        """Returns true if this is a "terminal" job (ie: no other job
+           is dependent on it"""
+        return (len(self._waiters) == 0)
+
+    def getTestSuite(self):
+        return self._testSuite
+
+    def getDirectories(self):
+        """Returns a dictionary containing 'private', 'shared', 'copy-private' and 'copy-shared'
+           indicating the directories to use for the job and the directories to
+           copy. If 'None', the directory is not required. If "", a new directory
+           needs to be created (name determined by the caller). This call is only
+           accurate after the job is ready to run (all dependences met).
+           A job can request two types of directories:
+               - a "shared" directory that is on a LUSTRE share (shared across nodes)
+               - a "private" directory located just on the node where the job is run
+           For each of these directories, the job can specify:
+               - whether it wants to inherit the directory from one of its parent (and which one)
+                 or get a copy of the original downloaded repository
+               - whether it wants a new directory or if it is OK using the parent's directory
+                 in place (for the original directory, a copy is always provided)
+               - whether it is OK sharing the directory with other concurrent jobs
+        """
+        if not self._recomputeDirs:
+            return self._dirs
+
+        self._dirs['private'] = self._dirs['shared'] = self._dirs['copy-private'] = self._dirs['copy-shared'] = None
+        
+        inheritFrom = max(self._requirePrivateRoot, self._requireSharedRoot)
+        if inheritFrom >= 0:
+            dirs = self._dependence[inheritFrom].job.getDirectories()
+            inheritFrom = (dirs['private'], dirs['shared'])
+        else:
+            inheritFrom = None
+
+        if self._requirePrivateRoot > -2:
+            if self._newDirectory:
+                self._dirs['private'] = ""
+                self._dirs['copy-private'] = JobObject.cleanDirectory if inheritFrom is None else inheritFrom[0]
+                self._dirs['copy-private'] = self._checkForNoneDir(self._dirs['copy-private'], 
+                                                                   inheritFrom[1], ("private", "shared"))
+            else:
+                if inheritFrom is None:
+                    self._dirs['private'] = ""
+                    # Copy only if using clean directory
+                    self._dirs['copy-private'] = JobObject.cleanDirectory
+                elif inheritFrom[0] is not None:
+                    # Simple case where we just use the parent's directory
+                    self._dirs['private'] = inheritFrom[0]
+                else:
+                    # Here we use the parent's shared directory and copy it
+                    # The copy is required to deal with base path issues
+                    assert(inheritFrom[1])
+                    self._dirs['private'] = ""
+                    self._dirs['copy-private'] = inheritFrom[1]
+
+        if self._requireSharedRoot > -2:
+            if self._newDirectory:
+                self._dirs['shared'] = ""
+                self._dirs['copy-shared'] = JobObject.cleanDirectory if inheritFrom is None else inheritFrom[1]
+                self._dirs['copy-shared'] = self._checkForNoneDir(self._dirs['copy-shared'], 
+                                                                   inheritFrom[0], ("shared", "private"))
+            else:
+                if inheritFrom is None:
+                    self._dirs['shared'] = ""
+                    # Copy only if using clean directory
+                    self._dirs['copy-shared'] = JobObject.cleanDirectory
+                elif inheritFrom[1] is not None:
+                    # Simple case where we just use the parent's directory
+                    self._dirs['shared'] = inheritFrom[1]
+                else:
+                    # Here we use the parent's private directory and copy it
+                    # The copy is required to deal with base path issues
+                    assert(inheritFrom[1])
+                    self._dirs['shared'] = ""
+                    self._dirs['copy-shared'] = inheritFrom[0]
+
+        self._recomputeDirs = False
+        self._myLog.debug("%s's initial directories are %s" % (str(self), str(self._dirs)))
+        return self._dirs
+
+    def execute(self):
+        """Tries to execute the job. Will return
+           the status of the job. If the job was
+           successfully launched, it will return RUNNING_LOCAL or
+           RUNNING_REMOTE
+        """
+        self._myLog.error("%s needs to define its own execute!!" % (str(self)))
+        assert(False)
+            
+    def poll(self):
+        """Checks if the job finished executing.
+           This will return True if the job is done
+           and False if it is still running
+        """
+        self._myLog.error("%s needs to define its own poll!!" % (str(self)))
+        assert(False)
+        
+        
+    def signalJobDone(self, returnCode):
+        """Called when the job finished executing. Updates everything
+           and triggers any dependence
+        """
+        self._recomputeStatus = True
+        self._endTime = datetime.now()
+        self._outFile.seek(0) # Go back to the beginning of the files
+        self._errFile.seek(0)
+        testCases = [None, None]
+        if returnCode == 0:
+            # We check whether we have an output file to use for the result
+            cmdLine = Template(self.jobType.param_cmd + " output " + self.param_args)
+            myEnv = self._getEnvironment()
+            cmdLine = cmdLine.substitute(myEnv)
+            args = shlex.split(cmdLine)
+            self._myLog.debug("%s getting output file with command '%s'" % (str(self), str(args)))
+            outputFile = None
+            myEnv.update(os.environ)
+            try:
+                outputFile = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
+            except subprocess.CalledProcessError:
+                self._myLog.warning("Could not get output file for %s... ignoring" % (str(self)))
+
+            if len(outputFile) == 0:
+                outputFile = None
+            else:
+                outputFile = outputFile.strip()
+            if outputFile is not None:
+                self._myLog.debug("%s got output file '%s'" % (str(self), outputFile))
+            else:
+                self._myLog.debug("%s has no defined output file" % (str(self)))
+            
+            if outputFile is not None and (not os.path.isfile(outputFile) or not os.path.isabs(outputFile)):
+                self._myLog.warning("Output file '%s' for %s is not a valid file or not an absolute path... ignoring result" %
+                                    (outputFile, str(self)))
+                outputFile = None
+            
+            if outputFile:
+                testCases[1] = TestCasesFile(outputFile)
+            
+            testCases[0] = TestCase("_main_" + self.name, self.name, 
+                                    (self._endTime - self._startTime).total_seconds(),
+                                    self._outFile.read(-1), self._errFile.read(-1))
+            self._jobStatus = JobObject.DONE_OK
+        else:
+            testCases[0] = TestCase("_main_" + self.name, self.name,
+                                    (self._endTime - self._startTime).total_seconds(),
+                                    self._outFile.read(-1), '')
+            if returnCode == -1:
+                # This means that it was terminated (probably due to a timeout)
+                testCases[0].add_error_info("JobObject was terminated due to timeout", self._errFile.read(-1))
+                self._jobStatus = JobObject.DONE_FAIL_TIMEOUT
+            elif returnCode == -2:
+                # This means the job was never fully specified
+                testCases[0].add_error_info("JobObject never fully specified")
+                self._jobStatus = JobObject.DONE_FAIL_LAUNCH
+            else:
+                testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode), self._errFile.read(-1))
+                self._jobStatus = JobObject.DONE_FAIL_STATUS
+        # Done if returnCode
+        self._outFile.close() # This should automatically delete the file
+        self._errFile.close()
+        self._outFile = self._errFile = None
+        self._process = None
+        
+        # Update the test suite
+        self._testSuite.add_test_case(testCases[0])
+        if testCases[1] is not None:
+            self._testSuite.add_test_case(testCases[1])
+        # Merge this test suite with the ones in the history
+        for dep in self._dependence:
+            self._testSuite.merge_cases(dep.job._testSuite)
+        
+        # Notify all waiters
+        for v in self._waiters.itervalues():
+            v[0].satisfyDependence(self, v[1])
+        
+    def _parseSandbox(self):
+        inheritDirFrom = None
+        for criteria in self._sandbox:
+            if criteria.startswith('inherit'):
+                if inheritDirFrom is not None:
+                    self._myLog.error("%s specifies multiple inherit parameters in sandbox" % (str(self)))
+                    assert(False)
+                try:
+                    inheritDirFrom = int(criteria[7:])
+                except ValueError:
+                    inheritDirFrom = len(self._dependence) # Will trigger error
+
+                if inheritDirFrom >= len(self._dependence):
+                    myLog.error("%s specifies an invalid inherit target (got %s, should be between 0 and %d)" %
+                                (str(self), criteria[7:], len(self._dependence) - 1))
+                    assert(False)
+            elif criteria == "createRoot":
+                self._newDirectory = True
+            elif criteria == "noCreateRoot":
+                self._newDirectory = False # Always after createRoot
+            elif criteria == "shareOK":
+                self._shareOK = True
+            elif criteria == "noShareOK":
+                self._shareOK = False
+            elif criteria == "single":
+                self._wholeMachine = True
+            elif criteria == "noSingle":
+                self._wholeMachine = False
+            elif criteria == "local":
+                self._requirePrivateRoot = -1
+            elif criteria == "noLocal":
+                self._requirePrivateRoot = -2
+                self._startInShared = True # We have no more local, so we have to start in shared
+            elif criteria == "shared":
+                self._requireSharedRoot = -1
+                if self._requirePrivatedRoot == -2:
+                    self._startInShared = True
+            elif criteria == "noShared":
+                self._requireSharedRoot = -2
+                self._startInShared = False # No share, so start in private for sure
+            else:
+                self._myLog.warning("%s specifies unknown criteria in sandbox ('%s') ... ignoring." % (str(self), criteria))
+        # end for over self.sandbox
+        if self._requirePrivateRoot == -2 and self._requireSharedRoot == -2:
+            self._myLog.warning("%s specifies no working directory ... defaulting to a private directory." % (str(self)))
+            self._requirePrivateRoot = -1
+        if inheritDirFrom is not None:
+            if self._requirePrivateRoot == -1:
+                self._requirePrivateRoot = inheritDirFrom
+            if self._requireSharedRoot == -1:
+                self._requireSharedRoot = inheritDirFrom
+        if self._newDirectory and self._shareOK:
+            self._myLog.warning("%s specifies a new directory and that sharing is OK ... ignoring sharing." % (str(self)))
+            self._shareOK = False
+        if self._shareOK and self._requirePrivateRoot < 0 and self._requireSharedRoot < 0:
+            self._myLog.warning("%s specifies sharing is OK but uses the original directories... ignoring sharing." % (str(self)))
+            self._shareOK = False
+        if self._wholeMachine and (not self.jobType.isLocal):
+            self._myLog.warning("%s is a remote job and specifies wholeMachine... ignoring wholeMachine as it only applies to local jobs." % (str(self)))
+            self._wholeMachine = False
+        if (not self.jobType.isLocal and (self._requirePrivateRoot > -2 or not self._startInShared)):
+            self.myLog.warning("%s is a remote job and specifies it needs a private space or starts in a private space... ignoring private space requirement." % (str(self)))
+            self._requirePrivateRoot = -2
+            self._startInShared = True
+
+    def _propagateDepthInfo(self):
+        """Helper function to update the depth of parents
+        """
+        for dep in self._dependence:
+            if not dep.isUnknown():
+                # For other dependences we don't care since
+                # they have already fired away
+                dep.job.updateDepth(self._depth + 1)
+        
+    def _updateStatus(self):
+        if not (self._jobStatus & 0xF0):
+            self._jobStatus = None
+            for dep in self._dependence:
+                if dep is None:
+                    self._jobStatus = JobObject.UNCONFIGURED_JOB
+                    break
+                if dep.isUnknown():
+                    self._jobStatus = JobObject.WAITING_JOB
+                    break
+                if not dep.isCleared():
+                    # At this point, it means that a dependence failed
+                    self._jobStatus = JobObject.BLOCKED_JOB
+                    break
+            if self._jobStatus is None:
+                self._jobStatus = JobObject.READY_JOB # Nothing happened so we are all good
+        #end if
+        self._recomputeStatus = False
+    
+    def _checkForNoneDir(self, directory, otherOption, errorNames):
+        if directory is None:
+            self._myLog.warning("%s needs a %s directory from its parent; not found so using a %s directory." %
+                                (str(self), errorNames[0], errorNames[1]))
+            directory = otherOption
+            if directory is None:
+                self._myLog.error("%s could not find a proper %s directory to use" % (str(self), errorNames[0]))
+            return directory
+
+    def _createJobDirectories(self):
+        """Sets up an environment for the job to
+        run in. This mostly sets up the directories
+        the way the job wants them"""
+        self._myLog.info("Creating directories for %s" % (str(self)))
+        if self._dirs['private'] == "":
+            # We need to create a new directory for the private copy
+            self._dirs['private'] = tempfile.mkdtemp(prefix="testDir_", dir=JobObject.privateRoot)
+        if self._dirs['shared'] == "":
+            self._dirs['shared'] = tempfile.mkdtemp(prefix="testDir_", dir=JobObject.sharedRoot)
+
+        self._myLog.debug("Directories for %s will be '%s' (non LUSTRE) and '%s' (LUSTRE)" %
+                          (str(self), self._dirs['private'], self._dirs['shared']))
+    
+    def _copyJobDirectories(self):
+        """This copies any data into the job directories if required"""
+        copyProcesses = [None, None]
+        if self._dirs['copy-private'] is not None:
+            # We need to copy this to self._dirs['private']
+            assert(self._dirs['private'] is not None)
+            assert(self._dirs['private'] <> "")
+            self._myLog.debug("Copying '%s' to '%s' for the non-LUSTRE directory" %
+                              (self._dirs['copy-private'], self._dirs['private']))
+            cmdLine = "rsync -a --exclude '.git' " + self._dirs['copy-private'] + "/ " + self._dirs['private']
+            args = shlex.split(cmdLine)
+            # We now have the proper command line to do the copy
+            copyProcesses[0] = subprocess.Popen(args)
+        if self._dirs['copy-shared'] is not None:
+            # We need to copy this to self._dirs['shared']
+            assert(self._dirs['shared'] is not None)
+            assert(self._dirs['shared'] <> "")
+            self._myLog.debug("Copying '%s' to '%s' for the LUSTRE directory" %
+                              (self._dirs['copy-shared'], self._dirs['shared']))
+            cmdLine = "rsync -a --exclude '.git' " + self._dirs['copy-shared'] + "/ " + self._dirs['shared']
+            args = shlex.split(cmdLine)
+            # We now have the proper command line to do the copy
+            copyProcesses[1] = subprocess.Popen(args)
+        self._myLog.debug("Waiting for copies to finish...")
+        if copyProcesses[0] is not None:
+            copyProcesses[0].wait()
+        if copyProcesses[1] is not None:
+            copyProcesses[1].wait()
+        self._myLog.debug("... All copies done")
+
+    def _grabJobDirectories(self):
+        """Grabs a kind of lock on the directories so that
+           the shareOK properties are respected. Returns True if
+           the directories could be grabbed and false otherwise
+        """
+        # Start with the private directory
+        if self._dirs['private'] is not None:
+            assert(self._dirs['private'] <> "")
+            usedInfo = JobObject.allUsedPaths.get(self._dirs['private'], None)
+            if (usedInfo is not None) and (usedInfo[0] or (usedInfo[1] > 0 and (not self._shareOK))):
+                # We cannot run the job because of a path conflict
+                self._myLog.warning("%s not running due to share conflict on non-LUSTRE '%s'" %
+                                    (str(self), self._dirs['private']))
+                return False
+            elif usedInfo is None:
+                # We create a new path information
+                JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK), 1)
+                self._myLog.debug("%s sole user of non-LUSTRE '%s'" % (str(self), self._dirs['private']))
+                # We update the path information
+            else:
+                # We update the information
+                JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1)
+                self._myLog.debug("%s sharing non-LUSTRE '%s' with %d other jobs" % 
+                                  (str(self), self._dirs['private'], usedInfo[1]))
+        # Now check the shared directory
+        if self._dirs['shared'] is not None:
+            assert(self._dirs['shared'] <> "")
+            usedInfo = JobObject.allUsedPaths.get(self._dirs['shared'], None)
+            if (usedInfo is not None) and (usedInfo[0] or (usedInfo[1] > 0 and (not self._shareOK))):
+                # We cannot run the job because of a path conflict
+                self._myLog.warning("%s not running due to share conflict on LUSTRE '%s'" % (str(self), self._dirs['shared']))
+                # We make sure to update the allUsedPaths for jobDirs[0]
+                if self._dirs['private'] is not None:
+                    usedInfo = JobObject.allUsedPaths[self._dirs['private']]
+                    # If we grabbed it, it was because everyone was OK sharing
+                    JobObject.allUsedPaths[self._dirs['private']] = (False, usedInfo[1] - 1)
+                return False
+            elif usedInfo is None:
+                # We create a new path information
+                JobObject.allUsedPaths[self._dirs['shared']] = ((not self._shareOK), 1)
+                self._myLog.debug("%s sole user of LUSTRE '%s'" % (str(self), self._dirs['shared']))
+            else:
+                # We update the information
+                JobObject.allUsedPaths[jobDirs[1]] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1)
+                self._myLog.debug("%s sharing LUSTRE '%s' with %d other jobs" % 
+                                  (str(self), self._dirs['shared'], usedInfo[1]))
+        return True
+
+    def _releaseJobDirectories(self):
+        """Release the hold on the directories"""
+        # Start with the private directory
+        if self._dirs['private'] is not None:
+            usedInfo = JobObject.allUsedPaths[self._dirs['private']]
+            self._myLog.debug("%s removing hold on non-LUSTRE '%s'; now have %d users" %
+                              (str(self), self._dirs['private'], usedInfo[1] - 1))
+            JobObject.allUsedPaths[self._dirs['private']] = (False, usedInfo[1] - 1)
+        # Now the shared directory
+        if self._dirs['shared'] is not None:
+            usedInfo = JobObject.allUsedPaths[self._dirs['shared']]
+            self._myLog.debug("%s removing hold on LUSTRE '%s'; now have %d users" %
+                              (str(self), self._dirs['shared'], usedInfo[1] - 1))
+            JobObject.allUsedPaths[self._dirs['shared']] = (False, usedInfo[1] - 1)
+        # All done
+
+    def _getEnvironment(self):
+        env = dict()
+        env['JJOB_NAME'] = self.name
+        env['JJOB_PRIVATE_HOME'] = self._dirs['private'] if self._dirs['private'] is not None else ""
+        env['JJOB_SHARED_HOME'] = self._dirs['shared'] if self._dirs['shared'] is not None else ""
+        env['JJOB_START_HOME'] = env['JJOB_SHARED_HOME'] if self._startInShared else env['JJOB_PRIVATE_HOME']
+        id = 0
+        for dep in self._dependence:
+            parentDirs = dep.job.getDirectories()
+            dir = parentDirs['private']
+            if dir is not None:
+                assert(dir <> "")
+                env['JJOB_PARENT_PRIVATE_HOME_' + str(id)] = dir
+            dir = parentDirs['shared']
+            if dir is not None:
+                assert(dir <> "")
+                env['JJOB_PARENT_SHARED_HOME_' + str(id)] = dir
+            id = id + 1
+        self._myLog.debug("Local environment additions for %s are: %s" % (str(self), str(env)))
+        return env
+
+    def __repr__(self):
+        """TODO: Need to make it more detailed"""
+        return str(self)
+
+    def __str__(self):
+        return "<JobObject '%s'>" % (self.name)
+
+
+class LocalJobObject(JobObject):
+    """A job that executes on the local machine"""
+    
+    def execute(self):
+        """Executes the job locally"""
+        if self._recomputeStatus:
+            self._updateStatus()
+        if self._recomputeDirs:
+            self.getDirectories()
+        
+        if self._jobStatus == JobObject.READY_JOB:
+                
+            self._myLog.info("Launching local job %s of type %s" % (str(self), str(self.jobType)))
+            # First we create the environment for the job
+            self._createJobDirectories()
+                
+            # We now check if the directories are OK to run in
+            if not self._grabJobDirectories():
+                # We don't actually need to destroy any directories since
+                # the only reason we can't grab the directories is
+                # we share them (ie: none were created in createJobDirectories)
+                return JobObject.READY_JOB
+            # At this point, we have "grabbed" all the directories
+            # We copy data if needed
+            self._copyJobDirectories()
+
+            # Set up the environment
+            myEnv = self._getEnvironment()
+
+            # Create files for the error and output streams
+            self._outFile = tempfile.TemporaryFile(mode="w+t", suffix="out", prefix="jjob_" + self.name + "_",
+                                                   dir="/tmp")
+            self._errFile = tempfile.TemporaryFile(mode="w+t", suffix="err", prefix="jjob_" + self.name + "_",
+                                                   dir="/tmp")
+                                                
+            # Form the command line
+            cmdLine = Template(self.jobType.run_cmd + " " + self.run_args)
+            cmdLine = cmdLine.substitute(myEnv) # Allow user to use JJOB_* macros
+            args = shlex.split(cmdLine)
+            
+            myEnv.update(os.environ)
+            self._myLog.debug("%s will execute with: %s" % (str(self), str(args)))
+    
+            self._startTime = datetime.now()
+            self._process = subprocess.Popen(args, stdout=self._outFile, stderr=self._errFile,
+                                             cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
+
+            return JobObject.RUNNING_LOCAL
+        else:
+            return self._jobStatus
+
+    def poll(self):
+        """Function to check whether a job has finished and if
+            so, clean things up properly and update everything
+            properly. Returns True if the process has completed (or
+            has been terminated) and False if it is still running
+        """
+        returnCode = self._process.poll()
+        if returnCode is None:
+            self._myLog.info("Polled %s and it is still running" % (str(self)))
+            # Process has not terminated yet. We check for the
+            # timeout
+            if self.timeout > 0:
+                # We have a timeout
+                now = datetime.now()
+                if (now - self._startTime).seconds > self.timeout:
+                    self.myLog.info("%s timed-out... Killing" % (str(self)))
+                    self._process.kill()
+                    self._process.wait()
+                    self._signalJobDone(-1)
+                    self._releaseJobDirectories(self)
+                    return True
+                else:
+                    self._myLog.debug("%s allowed to continue, ran for %d s but has %d s" % 
+                                      (str(self), (now - self._startTime).seconds, self.timeout))
+            else:
+                self._myLog.debug("%s allowed to continue, ran for %d s and does not have a timeout" %
+                                  (str(self), (now - self._startTime).seconds))
+        else:
+            # JobObject finished
+            self._myLog.info("%s finished running and returned %d" % (str(self), returnCode))
+            self.signalJobDone(returnCode)
+            self._releaseJobDirectories()
+            return True
+        return False
