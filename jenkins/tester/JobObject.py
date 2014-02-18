@@ -1,10 +1,42 @@
 #!/usr/bin/python
 
-import logging, os, shlex, subprocess, tempfile
+import logging, os, re, shlex, shutil, subprocess, tempfile
 from datetime import datetime, timedelta
 from junit_xml import TestCase, TestCasesFile, TestSuite
 from string import Template
 
+def mycopytree(src, dest):
+    names = os.listdir(src)
+    errors = []
+    myLog = logging.getLogger()
+    for name in names:
+        srcname = os.path.join(src, name)
+        destname = os.path.join(dest, name)
+        try:
+            if os.path.islink(srcname):
+                linkto = os.readlink(srcname)
+                os.symlink(linkto, destname)
+            elif os.path.isdir(srcname):
+                if name <> ".git": # Skip the .git directory
+                    shutil.copytree(srcname, destname, symlinks=True)
+            else:
+                shutil.copy2(srcname, destname)
+        except shutil.OSError as why:
+            errors.append((srcname, destname, str(why)))
+        except Error as err:
+            errors.extend(err)
+    # End of for over names
+    try:
+        shutil.copystat(src, dest)
+    except shutil.WindowsError:
+        pass
+    except shutil.OSError as why:
+        errors.append((src, dest, str(why)))
+    # Check if any errors
+    if len(errors):
+        myLog.error("Error copying '%s' to '%s', specific errors follow:" % (src, dest))
+        for err in errors:
+            myLog.error("\tFrom '%s' to '%s': %s" % (err[0], err[1], str(err[2])))
 
 class Dependence(object):
     """Convenience class to describe a dependence between
@@ -124,7 +156,6 @@ class JobObject(object):
         # These three variables are used when the process starts running
         self._outFile = None    # Out file to be used when this job executes
         self._errFile = None    # Err file to be used when this job executes
-        self._process = None    # sub-process executing this job
         self._startTime = None  # Time the process started running
         self._endTime   = None  # Time the process ended running
         
@@ -376,7 +407,6 @@ class JobObject(object):
            and triggers any dependence
         """
         self._recomputeStatus = True
-        self._endTime = datetime.now()
         self._outFile.seek(0) # Go back to the beginning of the files
         self._errFile.seek(0)
         testCases = [None, None]
@@ -393,11 +423,11 @@ class JobObject(object):
                 outputFile = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
             except subprocess.CalledProcessError:
                 self._myLog.warning("Could not get output file for %s... ignoring" % (str(self)))
-
+            
+            outputFile = outputFile.strip()
             if len(outputFile) == 0:
                 outputFile = None
-            else:
-                outputFile = outputFile.strip()
+
             if outputFile is not None:
                 self._myLog.debug("%s got output file '%s'" % (str(self), outputFile))
             else:
@@ -431,10 +461,12 @@ class JobObject(object):
                 testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode), self._errFile.read(-1))
                 self._jobStatus = JobObject.DONE_FAIL_STATUS
         # Done if returnCode
-        self._outFile.close() # This should automatically delete the file
-        self._errFile.close()
+        if self._outFile:
+            self._outFile.close() # This should automatically delete the file
+        if self._errFile:
+            self._errFile.close()
+
         self._outFile = self._errFile = None
-        self._process = None
         
         # Update the test suite
         self._testSuite.add_test_case(testCases[0])
@@ -447,6 +479,9 @@ class JobObject(object):
         # Notify all waiters
         for v in self._waiters.itervalues():
             v[0].satisfyDependence(self, v[1])
+
+        # Release hold on directories
+        self._releaseJobDirectories()
         
     def _parseSandbox(self):
         inheritDirFrom = None
@@ -483,7 +518,7 @@ class JobObject(object):
                 self._startInShared = True # We have no more local, so we have to start in shared
             elif criteria == "shared":
                 self._requireSharedRoot = -1
-                if self._requirePrivatedRoot == -2:
+                if self._requirePrivateRoot == -2:
                     self._startInShared = True
             elif criteria == "noShared":
                 self._requireSharedRoot = -2
@@ -566,33 +601,24 @@ class JobObject(object):
     
     def _copyJobDirectories(self):
         """This copies any data into the job directories if required"""
-        copyProcesses = [None, None]
+        self._myLog.debug("Starting directory copies...")
+        t = datetime.now()
         if self._dirs['copy-private'] is not None:
             # We need to copy this to self._dirs['private']
             assert(self._dirs['private'] is not None)
             assert(self._dirs['private'] <> "")
             self._myLog.debug("Copying '%s' to '%s' for the non-LUSTRE directory" %
                               (self._dirs['copy-private'], self._dirs['private']))
-            cmdLine = "rsync -a --exclude '.git' " + self._dirs['copy-private'] + "/ " + self._dirs['private']
-            args = shlex.split(cmdLine)
-            # We now have the proper command line to do the copy
-            copyProcesses[0] = subprocess.Popen(args)
+            mycopytree(self._dirs['copy-private'], self._dirs['private'])
         if self._dirs['copy-shared'] is not None:
             # We need to copy this to self._dirs['shared']
             assert(self._dirs['shared'] is not None)
             assert(self._dirs['shared'] <> "")
             self._myLog.debug("Copying '%s' to '%s' for the LUSTRE directory" %
                               (self._dirs['copy-shared'], self._dirs['shared']))
-            cmdLine = "rsync -a --exclude '.git' " + self._dirs['copy-shared'] + "/ " + self._dirs['shared']
-            args = shlex.split(cmdLine)
-            # We now have the proper command line to do the copy
-            copyProcesses[1] = subprocess.Popen(args)
-        self._myLog.debug("Waiting for copies to finish...")
-        if copyProcesses[0] is not None:
-            copyProcesses[0].wait()
-        if copyProcesses[1] is not None:
-            copyProcesses[1].wait()
-        self._myLog.debug("... All copies done")
+            mycopytree(self._dirs['copy-shared'], self._dirs['shared'])
+        t1 = datetime.now()
+        self._myLog.debug("... All copies done (took %d seconds)" % (t1 - t).seconds)
 
     def _grabJobDirectories(self):
         """Grabs a kind of lock on the directories so that
@@ -749,26 +775,200 @@ class LocalJobObject(JobObject):
             self._myLog.info("Polled %s and it is still running" % (str(self)))
             # Process has not terminated yet. We check for the
             # timeout
+            now = datetime.now()
+            self._endTime = now
             if self.timeout > 0:
                 # We have a timeout
-                now = datetime.now()
                 if (now - self._startTime).seconds > self.timeout:
                     self.myLog.info("%s timed-out... Killing" % (str(self)))
                     self._process.kill()
                     self._process.wait()
-                    self._signalJobDone(-1)
-                    self._releaseJobDirectories(self)
+                    self.signalJobDone(-1)
+                    self._releaseJobDirectories()
+                    self._process = None
                     return True
                 else:
-                    self._myLog.debug("%s allowed to continue, ran for %d s but has %d s" % 
+                    self._myLog.debug("%s allowed to continue, ran for %d seconds but has %d seconds" % 
                                       (str(self), (now - self._startTime).seconds, self.timeout))
             else:
-                self._myLog.debug("%s allowed to continue, ran for %d s and does not have a timeout" %
+                self._myLog.debug("%s allowed to continue, ran for %d seconds and does not have a timeout" %
                                   (str(self), (now - self._startTime).seconds))
         else:
             # JobObject finished
             self._myLog.info("%s finished running and returned %d" % (str(self), returnCode))
+            self._endTime = datetime.now()
             self.signalJobDone(returnCode)
-            self._releaseJobDirectories()
+            self._process = None
             return True
+        return False
+
+
+class TorqueJobObject(JobObject):
+    """A job that executes using the Torque job scheduler"""
+    
+    def execute(self):
+        """Executes the job using Torque"""
+        if self._recomputeStatus:
+            self._updateStatus()
+        if self._recomputeDirs:
+            self.getDirectories()
+        
+        if self._jobStatus == JobObject.READY_JOB:
+                
+            self._myLog.info("Launching remote job %s of type %s" % (str(self), str(self.jobType)))
+            # First we create the environment for the job
+            self._createJobDirectories()
+                
+            # We now check if the directories are OK to run in
+            if not self._grabJobDirectories():
+                # We don't actually need to destroy any directories since
+                # the only reason we can't grab the directories is
+                # we share them (ie: none were created in createJobDirectories)
+                return JobObject.READY_JOB
+            # At this point, we have "grabbed" all the directories
+            # We copy data if needed
+            self._copyJobDirectories()
+
+            # Set up the environment
+            myEnv = self._getEnvironment()
+
+            # We need to create the arguments for Qsub
+            # Get the string of required resources
+            cmdLine = Template(self.jobType.param_cmd + " resources " + self.param_args)
+            cmdLine = cmdLine.substitute(myEnv)
+            args = shlex.split(cmdLine)
+            self._myLog.debug("%s getting resources for Torque job with command '%s'" % (str(self), str(args)))
+            resourceString = None
+
+            myEnv.update(os.environ)
+
+            try:
+                resourceString = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
+            except subprocess.CalledProcessError:
+                self._myLog.error("Could not get a list of resources for %s... aborting job" % (str(self)))
+                self._startTime = self._endTime = datetime.now()
+                self.signalJobDone(-2)
+                return self._jobStatus
+            # We deal with the walltime resource requirement because that's
+            # how we add the timeout requirement
+            resourceString = resourceString.strip()
+            resourceStringNew = re.sub(r"walltime=[^,]*(,|$)", r"", resourceString).strip(',')
+            if len(resourceStringNew) <> len(resourceString):
+                self._myLog.warning("Stripping walltime resource restrictions from %s... added by timeout option" % (str(self)))
+
+            # Set the timeout
+            if self.timeout > 0:
+                self._myLog.debug("%s has a timeout, adding walltime restriction to Torque job (%d seconds)" % (str(self), self.timeout))
+                resourceString = resourceStringNew + ",walltime=%d" % (self.timeout)
+            
+            # Create files for the error and output streams
+            self._outFile = tempfile.NamedTemporaryFile(mode="w+t", suffix="out", prefix="jjob_" + self.name + "_",
+                                                   dir="/tmp")
+            self._errFile = tempfile.NamedTemporaryFile(mode="w+t", suffix="err", prefix="jjob_" + self.name + "_",
+                                                   dir="/tmp")
+            
+            # Form the argument to qsub
+            argCmd = ['/usr/local/bin/qsub', '-d', myEnv['JJOB_START_HOME'],
+                      '-e', self._errFile.name, '-j', 'n', '-k', 'n', '-l',
+                      resourceString, '-m', 'n', '-N', myEnv['JJOB_NAME'],
+                      '-o', self._outFile.name, '-p', '-10', '-q', 'batch',
+                      '-V']
+
+            # Since qsub only accepts a single script as input, we are going to
+            # have to convert to that form
+            self._scriptFile = tempfile.NamedTemporaryFile(mode="w+t", suffix="script.sh", prefix="jjob_" + self.name + "_",
+                                                           dir="/tmp")
+
+            # Write to the script file
+            self._scriptFile.write("#!/bin/bash\n")
+            # Form the script line
+            scriptLine = Template(self.jobType.run_cmd + " " + self.run_args)
+            scriptLine = scriptLine.substitute(myEnv) # Allow user to use JJOB_* macros
+            self._myLog.debug("%s command line is: '%s' (writting to '%s')" % (str(self),
+                                                                               scriptLine, self._scriptFile.name))
+            self._scriptFile.write(scriptLine)
+            self._scriptFile.write("\nexit $?\n")
+            self._scriptFile.flush()
+
+            argCmd.append(self._scriptFile.name)
+            self._myLog.debug("%s will execute remotely with: %s" % (str(self), str(argCmd)))
+            
+            self._startTime = datetime.now()
+            self._jobNumber = None
+            try:
+                self._jobNumber = subprocess.check_output(argCmd, cwd=myEnv['JJOB_START_HOME'],
+                                                          env=myEnv, shell=False)
+            except subprocess.CalledProcessError:
+                self._myLog.error("Could not launch QSub command for %s... aborting" % (str(self)))
+                self._myLog.error("Command was %s" % (str(argCmd)))
+                self._scriptFile.close() # This will remove this test file
+                self._endTime = self._startTime
+                self.signalJobDone(-2)
+                return self._jobStatus
+
+            # Here we have the job number
+            self._jobNumber = self._jobNumber.strip()
+            self._myLog.debug("%s was added to the Torque job queue with ID '%s'" % (str(self), self._jobNumber))
+            
+            return JobObject.RUNNING_REMOTE
+        else:
+            return self._jobStatus
+
+    def poll(self):
+        """Function to check whether a job has finished and if
+            so, clean things up properly and update everything
+            properly. Returns True if the process has completed (or
+            has been terminated) and False if it is still running
+        """
+        stateCompleteMatch = re.compile("job_state = ([CEHQRTWS])$", re.MULTILINE)
+        statusCheckMatch = re.compile("exit_status = ([0-9]+)$", re.MULTILINE)
+        timeCheckMatch = re.compile("resources_used.walltime = ([0-9:]+)$", re.MULTILINE)
+        
+        pollArgs = ['/usr/local/bin/qstat', '-f', self._jobNumber]
+        self._myLog.debug("%s: Checking for job completion with '%s'" % (str(self), str(pollArgs)))
+        pollOutput = None
+        try:
+            pollOutput = subprocess.check_output(pollArgs, shell=False)
+        except subprocess.CalledProcessError:
+            self._myLog.debug("%s: Job trace not yet available... will retry" % (str(self)))
+            return False
+        
+        # Now we can check if we have a completed job
+        self._endTime = now = datetime.now()
+
+        matchObj = stateCompleteMatch.search(pollOutput)
+        if matchObj is not None and matchObj.group(1) == "C":
+            self._myLog.info("Polled %s and it is marked as being complete" % (str(self)))
+
+            matchObj = (statusCheckMatch.search(pollOutput), timeCheckMatch.search(pollOutput))
+            if matchObj[0] is not None and matchObj[1] is not None:
+                self._myLog.info("%s finished running and returned %s" % (str(self), matchObj[0].group(1)))
+                # Compute the endtime based on Torque's information (more precise)
+                walltime = matchObj[1].group(1).split(':')
+                self._endTime = self._startTime + timedelta(hours=int(walltime[0]), minutes=int(walltime[1]),
+                                                            seconds=int(walltime[2]))
+                self.signalJobDone(int(matchObj[0].group(1)))
+            else:
+                self._myLog.error("%s completed but cannot read status... marking as aborted" % (str(self)))
+                self.signalJobDone(-1)
+
+            # In both cases, the job is done and we need to clean up
+            self._scriptFile.close()
+            return True
+        else:
+            curStatus = "in an unknown state"
+            if matchObj is not None:
+                if matchObj.group(1) == "Q":
+                    curStatus = "queued"
+                elif matchObj.group(1) == "E":
+                    curStatus = "exiting"
+                elif matchObj.group(1) == "R":
+                    curStatus = "running"
+                elif matchObj.group(1) == "H":
+                    curStatus = "being held"
+                else:
+                    curStatus = "in a weird state"
+            self._myLog.debug("%s is %s, ran for %d seconds" % 
+                              (str(self), curStatus,
+                               (now - self._startTime).seconds))
         return False

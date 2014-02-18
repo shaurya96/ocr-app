@@ -12,7 +12,7 @@ from junit_xml import TestSuite, TestCase
 from RECSortedList import RECSortedList
 
 # Import other objects
-from JobObject import JobObject, LocalJobObject, JobTypeObject
+from JobObject import JobObject, LocalJobObject, TorqueJobObject, JobTypeObject
 
 
 # Set up the logger
@@ -181,7 +181,7 @@ def mainLoop():
             elif v.getStatus() == JobObject.READY_JOB:
                 myLog.info("%s is now ready to run" % (v))
                 keysToRemove.append(k)
-                allReadyJobs.add((v.getDepth(), v))
+                allReadyJobs.add((-1*(v.getDepth()), v))
             elif v.getStatus() == JobObject.BLOCKED_JOB:
                 myLog.warning("%s is now blocked -- it will never run." % (v))
                 keysToRemove.append(k)
@@ -202,7 +202,8 @@ def mainLoop():
             if needWholeMachine:
                 break # We can't run any more jobs right now
             myLog.debug("Trying to run %s" % (str(allReadyJobs[i][1])))
-            if allReadyJobs[i][1].execute() > JobObject.READY_JOB:
+            returnedStatus = allReadyJobs[i][1].execute()
+            if returnedStatus > JobObject.BLOCKED_JOB and returnedStatus < JobObject.DONE_OK:
                 myLog.info("Starting %s" % (allReadyJobs[i][1]))
                 allRunningJobs.append(allReadyJobs[i][1])
                 if allReadyJobs[i][1].getIsWholeMachine():
@@ -210,8 +211,16 @@ def mainLoop():
                     needWholeMachine = True
                 allReadyJobs.pop(i)
                 effectiveEnd -= 1
+            elif returnedStatus > JobObject.DONE_OK:
+                # This means the job did not launch properly
+                myLog.warning("%s failed to launch properly... it will be reported as a failure" % (str(allReadyJobs[i][1])))
+                if allReadyJobs[i][1].getIsTerminalJob():
+                    allTerminalJobs.append(allReadyJobs[i][1])
+                allReadyJobs.pop(i)
             else:
-                myLog.debug("%s did not start... will retry later")
+                myLog.error("Status returned by execute not allowed for %s (got %d)" % (str(allReadyJobs[i][1]), returnedStatus))
+                # I don't really know what to do here. It should never happen
+                allReadyJobs.pop(i)
     
         # At this stage, we have launched all jobs that
         # could be launched. We will sleep before resuming the
@@ -405,7 +414,7 @@ def main(argv=None):
             if jobType.isLocal:
                 allRemainingJobs[k] = LocalJobObject(v, jobType, len(v['depends']))
             else:
-                raise Usage("Unsupported job type (for now)")
+                allRemainingJobs[k] = TorqueJobObject(v, jobType, len(v['depends']))
                 
         # Do another loop to set up the dependences properly
         for k, v in tempJobs.iteritems():
@@ -451,7 +460,7 @@ def main(argv=None):
     for k, v in allRemainingJobs.iteritems():
         if v.getStatus() == JobObject.READY_JOB:
             myLog.info("%s is initially ready to run" % (str(v)))
-            allReadyJobs.add((v.getDepth(), v))
+            allReadyJobs.add((-1*(v.getDepth()), v))
             toRemoveKeys.append(k)
     # Remove things from allRemainingJobs
     for k in toRemoveKeys:
