@@ -130,7 +130,7 @@ class JobObject(object):
     RUNNING_REMOTE   = 0x21 # JobObject is running over a job manager
     DONE_OK          = 0x40 # JobObject completed and returned a status of 0
     DONE_FAIL_LAUNCH = 0x41 # JobObject failed to launch
-    DONE_FAIL_TIMEOUT= 0x42 # JobObject failed due to a time-out
+    DONE_FAIL_RUN    = 0x42 # JobObject failed to complete
     DONE_FAIL_STATUS = 0x43 # JobObject ran and completed with a non-zero status
     
     @classmethod
@@ -402,7 +402,7 @@ class JobObject(object):
         assert(False)
         
         
-    def signalJobDone(self, returnCode):
+    def signalJobDone(self, returnCode, releaseDirs, errString = None):
         """Called when the job finished executing. Updates everything
            and triggers any dependence
         """
@@ -449,14 +449,19 @@ class JobObject(object):
             testCases[0] = TestCase("_main_" + self.name, self.name,
                                     (self._endTime - self._startTime).total_seconds(),
                                     self._outFile.read(-1), '')
-            if returnCode == -1:
-                # This means that it was terminated (probably due to a timeout)
-                testCases[0].add_error_info("JobObject was terminated due to timeout", self._errFile.read(-1))
-                self._jobStatus = JobObject.DONE_FAIL_TIMEOUT
-            elif returnCode == -2:
-                # This means the job was never fully specified
-                testCases[0].add_error_info("JobObject never fully specified")
-                self._jobStatus = JobObject.DONE_FAIL_LAUNCH
+            if errString is not None:
+                # Internal launch error
+                if returnCode == -1:
+                    # Job launched but did not complete
+                    testCases[0].add_error_info("JobObject launched but did not run to completion: %s" % (errString),
+                                                self._errFile.read(-1))
+                    self._jobStatus = JobObject.DONE_FAIL_RUN
+                elif returnCode == -2:
+                    # This means the job did not start running
+                    testCases[0].add_error_info("JobObject failed to launch: %s" % (errString))
+                    self._jobStatus = JobObject.DONE_FAIL_LAUNCH
+                else:
+                    assert(False) # No other internal error codes
             else:
                 testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode), self._errFile.read(-1))
                 self._jobStatus = JobObject.DONE_FAIL_STATUS
@@ -481,7 +486,8 @@ class JobObject(object):
             v[0].satisfyDependence(self, v[1])
 
         # Release hold on directories
-        self._releaseJobDirectories()
+        if releaseDirs:
+            self._releaseJobDirectories(returnCode <> 0)
         
     def _parseSandbox(self):
         inheritDirFrom = None
@@ -636,12 +642,12 @@ class JobObject(object):
                 return False
             elif usedInfo is None:
                 # We create a new path information
-                JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK), 1)
+                JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK), 1, 0)
                 self._myLog.debug("%s sole user of non-LUSTRE '%s'" % (str(self), self._dirs['private']))
                 # We update the path information
             else:
                 # We update the information
-                JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1)
+                JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1, usedInfo[2])
                 self._myLog.debug("%s sharing non-LUSTRE '%s' with %d other jobs" % 
                                   (str(self), self._dirs['private'], usedInfo[1]))
         # Now check the shared directory
@@ -655,33 +661,36 @@ class JobObject(object):
                 if self._dirs['private'] is not None:
                     usedInfo = JobObject.allUsedPaths[self._dirs['private']]
                     # If we grabbed it, it was because everyone was OK sharing
-                    JobObject.allUsedPaths[self._dirs['private']] = (False, usedInfo[1] - 1)
+                    JobObject.allUsedPaths[self._dirs['private']] = (False, usedInfo[1] - 1, usedInfo[2])
                 return False
             elif usedInfo is None:
                 # We create a new path information
-                JobObject.allUsedPaths[self._dirs['shared']] = ((not self._shareOK), 1)
+                JobObject.allUsedPaths[self._dirs['shared']] = ((not self._shareOK), 1, 0)
                 self._myLog.debug("%s sole user of LUSTRE '%s'" % (str(self), self._dirs['shared']))
             else:
                 # We update the information
-                JobObject.allUsedPaths[jobDirs[1]] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1)
+                JobObject.allUsedPaths[jobDirs[1]] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1, usedInfo[2])
                 self._myLog.debug("%s sharing LUSTRE '%s' with %d other jobs" % 
                                   (str(self), self._dirs['shared'], usedInfo[1]))
         return True
 
-    def _releaseJobDirectories(self):
+    def _releaseJobDirectories(self, isFail):
         """Release the hold on the directories"""
         # Start with the private directory
+        failureCount = 0
+        if isFail:
+            failureCount = 1
         if self._dirs['private'] is not None:
             usedInfo = JobObject.allUsedPaths[self._dirs['private']]
-            self._myLog.debug("%s removing hold on non-LUSTRE '%s'; now have %d users" %
-                              (str(self), self._dirs['private'], usedInfo[1] - 1))
-            JobObject.allUsedPaths[self._dirs['private']] = (False, usedInfo[1] - 1)
+            self._myLog.debug("%s removing hold on non-LUSTRE '%s'; now have %d users and %d failures" %
+                              (str(self), self._dirs['private'], usedInfo[1] - 1, usedInfo[2] + failureCount))
+            JobObject.allUsedPaths[self._dirs['private']] = (False, usedInfo[1] - 1, usedInfo[2] + failureCount)
         # Now the shared directory
         if self._dirs['shared'] is not None:
             usedInfo = JobObject.allUsedPaths[self._dirs['shared']]
-            self._myLog.debug("%s removing hold on LUSTRE '%s'; now have %d users" %
-                              (str(self), self._dirs['shared'], usedInfo[1] - 1))
-            JobObject.allUsedPaths[self._dirs['shared']] = (False, usedInfo[1] - 1)
+            self._myLog.debug("%s removing hold on LUSTRE '%s'; now have %d users and %d failures" %
+                              (str(self), self._dirs['shared'], usedInfo[1] - 1, usedInfo[2] + failureCount))
+            JobObject.allUsedPaths[self._dirs['shared']] = (False, usedInfo[1] - 1, usedInfo[2] + failureCount)
         # All done
 
     def _getEnvironment(self):
@@ -783,8 +792,7 @@ class LocalJobObject(JobObject):
                     self.myLog.info("%s timed-out... Killing" % (str(self)))
                     self._process.kill()
                     self._process.wait()
-                    self.signalJobDone(-1)
-                    self._releaseJobDirectories()
+                    self.signalJobDone(-1, True, "Local job timed-out")
                     self._process = None
                     return True
                 else:
@@ -797,7 +805,7 @@ class LocalJobObject(JobObject):
             # JobObject finished
             self._myLog.info("%s finished running and returned %d" % (str(self), returnCode))
             self._endTime = datetime.now()
-            self.signalJobDone(returnCode)
+            self.signalJobDone(returnCode, True)
             self._process = None
             return True
         return False
@@ -813,6 +821,13 @@ class TorqueJobObject(JobObject):
         if self._recomputeDirs:
             self.getDirectories()
         
+        if JobObject.runRemoteJobs == False:
+            self._myLog.info("Remote job %s cannot launch because only local jobs are being run" %
+                             (str(self)))
+            self.signalJobDone(-1, False, "Only local jobs are enabled")
+            self._jobStatus = JobObject.DONE_FAIL_LAUNCH
+            return self._jobStatus
+            
         if self._jobStatus == JobObject.READY_JOB:
                 
             self._myLog.info("Launching remote job %s of type %s" % (str(self), str(self.jobType)))
@@ -847,7 +862,7 @@ class TorqueJobObject(JobObject):
             except subprocess.CalledProcessError:
                 self._myLog.error("Could not get a list of resources for %s... aborting job" % (str(self)))
                 self._startTime = self._endTime = datetime.now()
-                self.signalJobDone(-2)
+                self.signalJobDone(-2, True, "Remote job could not get resource list")
                 return self._jobStatus
             # We deal with the walltime resource requirement because that's
             # how we add the timeout requirement
@@ -898,12 +913,13 @@ class TorqueJobObject(JobObject):
             try:
                 self._jobNumber = subprocess.check_output(argCmd, cwd=myEnv['JJOB_START_HOME'],
                                                           env=myEnv, shell=False)
-            except subprocess.CalledProcessError:
-                self._myLog.error("Could not launch QSub command for %s... aborting" % (str(self)))
+            except subprocess.CalledProcessError, err:
+                self._myLog.error("Could not launch QSub command for %s... (error '%s' code %d) aborting" % 
+                                  (str(self), err.output, err.returncode))
                 self._myLog.error("Command was %s" % (str(argCmd)))
                 self._scriptFile.close() # This will remove this test file
                 self._endTime = self._startTime
-                self.signalJobDone(-2)
+                self.signalJobDone(-2, True, "QSub returned %d (%s)" % (err.returncode, err.output))
                 return self._jobStatus
 
             # Here we have the job number
@@ -947,10 +963,10 @@ class TorqueJobObject(JobObject):
                 walltime = matchObj[1].group(1).split(':')
                 self._endTime = self._startTime + timedelta(hours=int(walltime[0]), minutes=int(walltime[1]),
                                                             seconds=int(walltime[2]))
-                self.signalJobDone(int(matchObj[0].group(1)))
+                self.signalJobDone(int(matchObj[0].group(1)), True)
             else:
                 self._myLog.error("%s completed but cannot read status... marking as aborted" % (str(self)))
-                self.signalJobDone(-1)
+                self.signalJobDone(-1, True, "Remote job has unknown job status")
 
             # In both cases, the job is done and we need to clean up
             self._scriptFile.close()

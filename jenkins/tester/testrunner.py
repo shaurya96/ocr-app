@@ -85,6 +85,7 @@ allTerminalJobs = []
     - Value: A pair: 
         - 1st Element is True if one of the jobs is not OK with sharing
         - 2nd Element is a count of jobs running in this directory
+        - 3rd Element is a count of failed jobs in that directory
 """
 allUsedPaths = dict()
 
@@ -237,6 +238,13 @@ def main(argv=None):
     global countBlockedJobs
     testKeywords = []
 
+    KEEP_NONE = 0
+    KEEP_FAILURE = 1
+    KEEP_ALL = 2
+
+    keepDirs = KEEP_NONE # Which directories to keep after the test
+    runRemoteJobs = True # Whether or not to run remote jobs
+
     myLog = logging.getLogger()
 
     if argv is None:
@@ -247,9 +255,9 @@ def main(argv=None):
     resultFileName = None
     try:
         try:
-            opts, args = getopt.getopt(argv[1:], "hc:i:s:p:t:k:o:fd", ["help", "config=", "initdir=", "shared=",
+            opts, args = getopt.getopt(argv[1:], "hc:i:s:p:t:k:o:d", ["help", "config=", "initdir=", "shared=",
                                                                        "private=", "time=", "keyword=", "output=",
-                                                                       "full-help", "debug"])
+                                                                       "full-help", "debug", "local-only", "no-clean="])
         except getopt.error, err:
             raise Usage(err)
         for o, a in opts:
@@ -257,7 +265,7 @@ def main(argv=None):
                 raise Usage(\
 """
     -h,--help:      Prints this message
-    -f,--full-help: Prints a detailed message on the format of jobs and job types
+    --full-help:    Prints a detailed message on the format of jobs and job types
     -d,--debug:     Enable debugging
     -c,--config:    Test files to import (without .py extension). The files should contain
                     the description of the tests to run. Can be specified multiple times
@@ -268,8 +276,12 @@ def main(argv=None):
     -k,--keyword:   (optional) Keywords to use to select the test to run. If specified multiple times,
                     only the tests that match ALL the keywords will be run.
     -o,--output:    Filename to produce containing the results of the tests
+    --local-only:   Runs only local tests (tests that do not require Torque and/or LUSTRE)
+    --no-clean:     Can be either 'all' or 'failure'. If 'all', all build directories
+                    will be maintained after completion of the test. If 'failure', all
+                    directories with at least one failure in them will be maintained.
 """)
-            elif o in ("-f", '--full-help'):
+            elif o in ('--full-help'):
                 raise Usage(\
 """
     Each job type must specify the following arguments:
@@ -390,6 +402,15 @@ def main(argv=None):
                 testKeywords.append(a)
             elif o in ("-o", "--output"):
                 resultFileName = a
+            elif o in ("--no-clean"):
+                if a == 'all':
+                    keepDirs = KEEP_ALL
+                elif a == 'failure':
+                    keepDirs = KEEP_FAILURE
+                else:
+                    raise Usage("Value %s is not valid for '--no-clean'" % (a))
+            elif o in ("--local-only"):
+                runRemoteJobs = False
             else:
                 raise Usage("Unhandled option")
         if args is not None and len(args) > 0:
@@ -401,7 +422,7 @@ def main(argv=None):
 
     # Set the globals
     JobObject.setGlobals(cleanDirectory=cleanDirectory, sharedRoot=sharedRoot,
-                         privateRoot=privateRoot, allUsedPaths=allUsedPaths)
+                         privateRoot=privateRoot, allUsedPaths=allUsedPaths, runRemoteJobs=runRemoteJobs)
 
     try:
         # At this point we have all the job types and we can do other checks
@@ -491,8 +512,19 @@ def main(argv=None):
     for k, v in allUsedPaths.iteritems():
         assert(not v[0])
         assert(v[1] == 0)
-        myLog.debug("Removing work directory '%s'" % (k))
-        shutil.rmtree(k)
+        doRemove = True
+        if keepDirs == KEEP_FAILURE:
+            # We only keep if there is a failure
+            if v[2] > 0:
+                myLog.info("Keeping work directory '%s' due to %d jobs failing in it" 
+                           % (k, v[2]))
+                doRemove = False
+        elif keepDirs == KEEP_ALL:
+            myLog.info("Keeping work directory '%s'" % (k))
+            doRemove = False
+        if doRemove:
+            myLog.debug("Removing work directory '%s'" % (k))
+            shutil.rmtree(k)
 
     myLog.info("---- Done ----")
 
