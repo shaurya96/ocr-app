@@ -558,7 +558,7 @@ class JobObject(object):
         """Helper function to update the depth of parents
         """
         for dep in self._dependence:
-            if not dep.isUnknown():
+            if dep is not None and not dep.isUnknown():
                 # For other dependences we don't care since
                 # they have already fired away
                 dep.job.updateDepth(self._depth + 1)
@@ -595,7 +595,7 @@ class JobObject(object):
         """Sets up an environment for the job to
         run in. This mostly sets up the directories
         the way the job wants them"""
-        self._myLog.info("Creating directories for %s" % (str(self)))
+        self._myLog.debug("Creating directories for %s" % (str(self)))
         if self._dirs['private'] == "":
             # We need to create a new directory for the private copy
             self._dirs['private'] = tempfile.mkdtemp(prefix="testDir_", dir=JobObject.privateRoot)

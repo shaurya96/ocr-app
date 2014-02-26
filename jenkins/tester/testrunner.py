@@ -154,7 +154,7 @@ def mainLoop():
 
     myLog = logging.getLogger()
     while len(allRemainingJobs) > 0 or len(allReadyJobs) or len(allRunningJobs):
-        myLog.debug("Looping with %d remaining jobs" % (len(allRemainingJobs)))
+        myLog.debug("Looping with %d remaining jobs" % (len(allRemainingJobs) + len(allReadyJobs)))
         myLog.debug("Have %d blocked jobs and %d ready jobs" % 
                     (countBlockedJobs, len(allReadyJobs)))
         needWholeMachine = False;
