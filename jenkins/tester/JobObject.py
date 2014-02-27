@@ -419,6 +419,7 @@ class JobObject(object):
             self._myLog.debug("%s getting output file with command '%s'" % (str(self), str(args)))
             outputFile = None
             myEnv.update(os.environ)
+            myEnv['PYTHONIOENCODING'] = 'utf-8'
             try:
                 outputFile = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
             except subprocess.CalledProcessError:
@@ -443,18 +444,18 @@ class JobObject(object):
             
             testCases[0] = TestCase("_main_" + self.name, self.name, 
                                     (self._endTime - self._startTime).total_seconds(),
-                                    self._outFile.read(-1), self._errFile.read(-1))
+                                    self._outFile.read(-1).decode('utf-8'), self._errFile.read(-1).decode('utf-8'))
             self._jobStatus = JobObject.DONE_OK
         else:
             testCases[0] = TestCase("_main_" + self.name, self.name,
                                     (self._endTime - self._startTime).total_seconds(),
-                                    self._outFile.read(-1), '')
+                                    self._outFile.read(-1).decode('utf-8'), '')
             if errString is not None:
                 # Internal launch error
                 if returnCode == -1:
                     # Job launched but did not complete
                     testCases[0].add_error_info("JobObject launched but did not run to completion: %s" % (errString),
-                                                self._errFile.read(-1))
+                                                self._errFile.read(-1).decode('utf-8'))
                     self._jobStatus = JobObject.DONE_FAIL_RUN
                 elif returnCode == -2:
                     # This means the job did not start running
@@ -463,7 +464,7 @@ class JobObject(object):
                 else:
                     assert(False) # No other internal error codes
             else:
-                testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode), self._errFile.read(-1))
+                testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode), self._errFile.read(-1).decode('utf-8'))
                 self._jobStatus = JobObject.DONE_FAIL_STATUS
         # Done if returnCode
         if self._outFile:
@@ -752,9 +753,9 @@ class LocalJobObject(JobObject):
             myEnv = self._getEnvironment()
 
             # Create files for the error and output streams
-            self._outFile = tempfile.TemporaryFile(mode="w+t", suffix="out", prefix="jjob_" + self.name + "_",
+            self._outFile = tempfile.TemporaryFile(mode="w+b", suffix="out", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
-            self._errFile = tempfile.TemporaryFile(mode="w+t", suffix="err", prefix="jjob_" + self.name + "_",
+            self._errFile = tempfile.TemporaryFile(mode="w+b", suffix="err", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
                                                 
             # Form the command line
@@ -763,6 +764,7 @@ class LocalJobObject(JobObject):
             args = shlex.split(cmdLine)
             
             myEnv.update(os.environ)
+            myEnv['PYTHONIOENCODING'] = 'utf-8'
             self._myLog.debug("%s will execute with: %s" % (str(self), str(args)))
     
             self._startTime = datetime.now()
@@ -856,7 +858,7 @@ class TorqueJobObject(JobObject):
             resourceString = None
 
             myEnv.update(os.environ)
-
+            myEnv['PYTHONIOENCODING'] = 'utf-8'
             try:
                 resourceString = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
             except subprocess.CalledProcessError:
@@ -877,9 +879,9 @@ class TorqueJobObject(JobObject):
                 resourceString = resourceStringNew + ",walltime=%d" % (self.timeout)
             
             # Create files for the error and output streams
-            self._outFile = tempfile.NamedTemporaryFile(mode="w+t", suffix="out", prefix="jjob_" + self.name + "_",
+            self._outFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="out", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
-            self._errFile = tempfile.NamedTemporaryFile(mode="w+t", suffix="err", prefix="jjob_" + self.name + "_",
+            self._errFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="err", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
             
             # Form the argument to qsub
@@ -891,7 +893,7 @@ class TorqueJobObject(JobObject):
 
             # Since qsub only accepts a single script as input, we are going to
             # have to convert to that form
-            self._scriptFile = tempfile.NamedTemporaryFile(mode="w+t", suffix="script.sh", prefix="jjob_" + self.name + "_",
+            self._scriptFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="script.sh", prefix="jjob_" + self.name + "_",
                                                            dir="/tmp")
 
             # Write to the script file

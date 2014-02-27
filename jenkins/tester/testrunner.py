@@ -503,9 +503,9 @@ def main(argv=None):
     allTestSuites = [job.getTestSuite() for job in allTerminalJobs]
     if resultFileName:
         resultFile = open(resultFileName, "w")
-        TestSuite.to_file(resultFile, allTestSuites)
+        TestSuite.to_file(resultFile, allTestSuites, encoding='utf-8')
     else:
-        TestSuite.to_file(sys.stdout, allTestSuites)
+        TestSuite.to_file(sys.stdout, allTestSuites, encoding='utf-8')
 
     # Remove directories (do this now because some of the result files
     # may be in the directories)
