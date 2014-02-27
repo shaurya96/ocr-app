@@ -502,7 +502,7 @@ class JobObject(object):
                     inheritDirFrom = len(self._dependence) # Will trigger error
 
                 if inheritDirFrom >= len(self._dependence):
-                    myLog.error("%s specifies an invalid inherit target (got %s, should be between 0 and %d)" %
+                    self._myLog.error("%s specifies an invalid inherit target (got %s, should be between 0 and %d)" %
                                 (str(self), criteria[7:], len(self._dependence) - 1))
                     assert(False)
             elif criteria == "createRoot":
@@ -550,7 +550,7 @@ class JobObject(object):
             self._myLog.warning("%s is a remote job and specifies wholeMachine... ignoring wholeMachine as it only applies to local jobs." % (str(self)))
             self._wholeMachine = False
         if (not self.jobType.isLocal and (self._requirePrivateRoot > -2 or not self._startInShared)):
-            self.myLog.warning("%s is a remote job and specifies it needs a private space or starts in a private space... ignoring private space requirement." % (str(self)))
+            self._myLog.warning("%s is a remote job and specifies it needs a private space or starts in a private space... ignoring private space requirement." % (str(self)))
             self._requirePrivateRoot = -2
             self._startInShared = True
 
@@ -789,7 +789,7 @@ class LocalJobObject(JobObject):
             if self.timeout > 0:
                 # We have a timeout
                 if (now - self._startTime).seconds > self.timeout:
-                    self.myLog.info("%s timed-out... Killing" % (str(self)))
+                    self._myLog.info("%s timed-out... Killing" % (str(self)))
                     self._process.kill()
                     self._process.wait()
                     self.signalJobDone(-1, True, "Local job timed-out")
