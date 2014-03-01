@@ -16,12 +16,26 @@ from JobObject import JobObject, LocalJobObject, TorqueJobObject, JobTypeObject
 
 
 # Set up the logger
+class MyFilter(object):
+    def __init__(self, highLevel):
+        self.highLevel = highLevel
+
+    def filter(self, record):
+        if record.levelno < self.highLevel:
+            return 1
+        return 0
+
 logging.getLogger().setLevel(logging.DEBUG)
-streamHandler = logging.StreamHandler()
-streamHandler.setLevel(logging.INFO)
+streamHandlerStdOut = logging.StreamHandler(sys.stdout)
+streamHandlerStdErr = logging.StreamHandler()
+streamHandlerStdErr.setLevel(logging.WARNING)
+streamHandlerStdOut.setLevel(logging.INFO)
 streamFormatter = logging.Formatter('%(levelname)-8s %(message)s')
-streamHandler.setFormatter(streamFormatter)
-logging.getLogger().addHandler(streamHandler)
+streamHandlerStdErr.setFormatter(streamFormatter)
+streamHandlerStdOut.setFormatter(streamFormatter)
+streamHandlerStdOut.addFilter(MyFilter(logging.WARNING)) # Leave WARNING and ERROR to stderr
+logging.getLogger().addHandler(streamHandlerStdErr)
+logging.getLogger().addHandler(streamHandlerStdOut)
 
 # Global variables used to keep track of jobs
 """Initial directory fetched from
@@ -234,7 +248,7 @@ def main(argv=None):
     global cleanDirectory, sharedRoot, privateRoot, sleepInterval
     global allRemainingJobs, allJobTypes, allRunningJobs, allReadyJobs, allTerminalJobs
     global allUsedPaths
-    global streamHandler
+    global streamHandlerStdOut
     global countBlockedJobs
     testKeywords = []
 
@@ -250,6 +264,7 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv
 
+    doHierarchicalResults = False
     myLog.info("---- Starting ----")
     tempJobs = dict() # Contains the jobs until we have parsed all the job types
     resultFileName = None
@@ -257,7 +272,8 @@ def main(argv=None):
         try:
             opts, args = getopt.getopt(argv[1:], "hc:i:s:p:t:k:o:d", ["help", "config=", "initdir=", "shared=",
                                                                        "private=", "time=", "keyword=", "output=",
-                                                                       "full-help", "debug", "local-only", "no-clean="])
+                                                                       "full-help", "debug", "local-only", "no-clean=",
+                                                                       "hier-results"])
         except getopt.error, err:
             raise Usage(err)
         for o, a in opts:
@@ -271,11 +287,18 @@ def main(argv=None):
                     the description of the tests to run. Can be specified multiple times
     -i,--initdir:   Initial checked-out directory containing the entire GIT tree
     -s,--shared:    Root directory to use for "shared" workspaces (shared by LUSTRE)
+                    Optional if '--local-only' is specified
     -p,--private:   Root directory to use for "private" (local) workspaces
     -t,--time:      Time to wait before each iteration of the job scheduling algorithm
     -k,--keyword:   (optional) Keywords to use to select the test to run. If specified multiple times,
                     only the tests that match ALL the keywords will be run.
     -o,--output:    Filename to produce containing the results of the tests
+    --hier-results: Output results hierarchically in Jenkins. This means that the top-level
+                    "packages" will be the name of the terminating jobs and the "classes"
+                    inside will be the name of the jobs that were required along the path
+                    to running the terminal job. If not specified, there will be a "root"
+                    package and all tests (terminal or not) will be listed as independent
+                    classes.
     --local-only:   Runs only local tests (tests that do not require Torque and/or LUSTRE)
     --no-clean:     Can be either 'all' or 'failure'. If 'all', all build directories
                     will be maintained after completion of the test. If 'failure', all
@@ -354,7 +377,7 @@ def main(argv=None):
             - noShared:     Like 'noLocal' but for 'shared'
 """)
             elif o in ("-d", "--debug"):
-                streamHandler.setLevel(logging.DEBUG)
+                streamHandlerStdOut.setLevel(logging.DEBUG)
             elif o in ("-c", "--config"):
                 try:
                     (importPath, name) = os.path.split(a)
@@ -402,6 +425,8 @@ def main(argv=None):
                 testKeywords.append(a)
             elif o in ("-o", "--output"):
                 resultFileName = a
+            elif o in ("--hier-results"):
+                doHierarchicalResults = True
             elif o in ("--no-clean"):
                 if a == 'all':
                     keepDirs = KEEP_ALL
@@ -415,6 +440,34 @@ def main(argv=None):
                 raise Usage("Unhandled option")
         if args is not None and len(args) > 0:
             raise Usage("Extraneous arguments")
+
+        # Now check if we have everything we need
+        # TODO: Add permission checks maybe
+        if cleanDirectory is None:
+            raise Usage("Missing checked-out directory")
+        else:
+            cleanDirectory = os.path.realpath(cleanDirectory)
+        if privateRoot is None:
+            raise Usage("Missing private root directory")
+        else:
+            privateRoot = os.path.realpath(privateRoot)
+        if runRemoteJobs and (sharedRoot is None):
+            raise Usage("Missing shared root directory")
+        elif runRemoteJobs:
+            sharedRoot = os.path.realpath(sharedRoot)
+        if sleepInterval is None:
+            myLog.warning("Sleep interval not specified... assuming 5 seconds")
+            sleepInterval = 5
+        if resultFileName is None:
+            myLog.warning("No output filename specified, results will be dumped to stdout")
+        else:
+            resultFileName = os.path.realpath(resultFileName)
+
+        # Check if we will have circular copy issues
+        if privateRoot.startswith(cleanDirectory):
+            raise Usage("The private root directory cannot be within the checked-out directory")
+        if sharedRoot and sharedRoot.startswith(cleanDirectory):
+            raise Usage("The shared root directory cannot be within the checked-out directory")
     except Usage, msg:
         print >> sys.stderr, msg.msg
         print >> sys.stderr, "For help, use -h"
@@ -455,20 +508,6 @@ def main(argv=None):
                 toRemoveKeys.append(k)
         for k in toRemoveKeys:
             del allRemainingJobs[k]
-
-        # Now check if we have everything we need
-        # TODO: Add permission checks maybe
-        if cleanDirectory is None:
-            raise Usage("Missing checked-out directory")
-        if privateRoot is None:
-            raise Usage("Missing private root directory")
-        if sharedRoot is None:
-            raise Usage("Missing shared root directory")
-        if sleepInterval is None:
-            myLog.warning("Sleep interval not specified... assuming 5 seconds")
-            sleepInterval = 5
-        if resultFileName is None:
-            myLog.warning("No output filename specified, results will be dumped to stdout")
     except Usage, msg:
         print >> sys.stderr, msg.msg
         print >> sys.stderr, "For help, use -h"
@@ -503,9 +542,9 @@ def main(argv=None):
     allTestSuites = [job.getTestSuite() for job in allTerminalJobs]
     if resultFileName:
         resultFile = open(resultFileName, "w")
-        TestSuite.to_file(resultFile, allTestSuites, encoding='utf-8')
+        TestSuite.to_file(resultFile, allTestSuites, encoding='utf-8', doHierarchical=doHierarchicalResults)
     else:
-        TestSuite.to_file(sys.stdout, allTestSuites, encoding='utf-8')
+        TestSuite.to_file(sys.stdout, allTestSuites, encoding='utf-8', doHierarchical=doHierarchicalResults)
 
     # Remove directories (do this now because some of the result files
     # may be in the directories)

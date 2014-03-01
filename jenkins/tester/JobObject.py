@@ -179,7 +179,7 @@ class JobObject(object):
                                           # private to the machine
 
         # Place where we put the result
-        self._testSuite = TestSuite(self.name)
+        self._testSuite = TestSuite(self.name, package=self.name)
 
         # Status variables
         if dependenceCount == 0:

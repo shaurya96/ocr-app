@@ -66,7 +66,7 @@ class TestSuite(object):
     def merge_cases(self, testSuite):
         self.test_cases.extend(testSuite.test_cases)
 
-    def writeOut(self, xmlfile):
+    def writeOut(self, xmlfile, doHierarchical):
         """Builds the XML document for the JUnit test suite"""
         # build the test suite element
         test_suite_attributes = dict()
@@ -96,16 +96,16 @@ class TestSuite(object):
                     props_element.append(etree.Element("property", attrib=attrs))
                 xmlfile.write(props_element)
             for c in self.test_cases:
-                c.writeOut(xmlfile)
+                c.writeOut(xmlfile, self.package if doHierarchical else None)
 
     @staticmethod
-    def to_file(file_name, test_suites, encoding=None):
+    def to_file(file_name, test_suites, encoding=None, doHierarchical=False):
         """Writes the JUnit XML document to file"""
         with etree.xmlfile(file_name, encoding=encoding) as xf:
             xf.write_declaration(standalone=True)
             with xf.element("testsuites"):
                 for ts in test_suites:
-                    ts.writeOut(xf)
+                    ts.writeOut(xf, doHierarchical)
 
     @staticmethod
     def _clean_illegal_xml_chars(string_to_clean):
@@ -142,8 +142,11 @@ class TestCasesFile(object):
             elem.clear()
             break
     
-    def writeOut(self, xmlfile):
+    def writeOut(self, xmlfile, packageName):
         for event, elem in etree.iterparse(self._filePath, events=("end",), tag="testcase"):
+            if packageName is not None:
+                oldClassName = elem.get('classname', '<unknown>')
+                elem.set('classname', packageName + '.' + oldClassName)
             xmlfile.write(elem)
             elem.clear()
     
@@ -179,7 +182,7 @@ class TestCase(object):
         self.skipped_message = None
         self.skipped_output = None
 
-    def writeOut(self, xmlfile):
+    def writeOut(self, xmlfile, packageName):
         # Build the element and output it
         test_case_attributes = dict()
         test_case_attributes['name'] = str(self.name)
@@ -187,6 +190,10 @@ class TestCase(object):
             test_case_attributes['time'] = "%f" % self.elapsed_sec
         if self.classname:
             test_case_attributes['classname'] = str(self.classname)
+        else:
+            test_case_attributes['classname'] = '<unknown>'
+        if packageName is not None:
+            test_case_attributes['classname'] = packageName + '.' + test_case_attributes['classname']
 
         # Build the root element
         test_case_element = etree.Element("testcase", attrib=test_case_attributes)
