@@ -9,6 +9,7 @@ from operator import itemgetter
 sys.path.append('./external')
 
 from junit_xml import TestSuite, TestCase
+from filelock import filelock
 from RECSortedList import RECSortedList
 
 # Import other objects
@@ -43,6 +44,12 @@ GIT. This is the reference directory that
 contains the entire checked-out tree (absolute path)
 """
 cleanDirectory = None
+
+"""Environment directory
+This directory contains pre-built executables
+for example which are built more infrequently to allow
+for more incremental testing"""
+envDirectory = None
 
 """"Root" directory that is shared (with LUSTRE)
 across the various nodes. All tests will have their
@@ -96,7 +103,7 @@ allTerminalJobs = []
 
 """All running jobs by paths. The dictionary contains:
     - Key: The path where the job is running
-    - Value: A pair: 
+    - Value: A pair:
         - 1st Element is True if one of the jobs is not OK with sharing
         - 2nd Element is a count of jobs running in this directory
         - 3rd Element is a count of failed jobs in that directory
@@ -108,7 +115,7 @@ def checkDict(inputDict, typeStr, fieldTypes, mandatoryFields):
     """Checks whether input matches a certain format. This
     checks to see if the fields are of the proper type
     and if mandatory fields are present once and only once"""
-   
+
     myLog = logging.getLogger();
     countPresence = [0] * len(mandatoryFields)
     if type(inputDict) != type(dict()):
@@ -133,6 +140,17 @@ def checkDict(inputDict, typeStr, fieldTypes, mandatoryFields):
             return False
     return True
 
+# Check if a list of keywords has the keywords in the second list
+def hasKeywords(enclosingList, keywords, allKeywords):
+    myKw = frozenset(enclosingList)
+    theirKw = frozenset(keywords)
+    if allKeywords:
+        # Test for subset
+        return theirKw <= myKw
+    else:
+        # Check length of intersection
+        return len(myKw & theirKw) > 0
+
 # Check whether a job has the proper format
 def checkJob(inputDict):
     checkStruct = {'name': "", 'depends': (),
@@ -151,7 +169,7 @@ def checkJobType(inputDict):
     checkPresence = ('name', 'keywords', 'isLocal', 'run-cmd', 'param-cmd',
                      'sandbox')
     return checkDict(inputDict, "JobObject type", checkStruct, checkPresence)
-    
+
 # Print usage
 class Usage:
     def __init__(self, msg):
@@ -161,15 +179,22 @@ class Usage:
 # tasks to run and collects their results. It will return
 # when there are no tasks that can be run
 def mainLoop():
-    global cleanDirectory, sharedRoot, privateRoot, sleepInterval
+    global cleanDirectory, envDirectory, sharedRoot, privateRoot, sleepInterval
     global allRemainingJobs, allJobTypes, allRunningJobs, allReadyJobs, allTerminalJobs
     global allUsedPaths
     global countBlockedJobs
 
+    waitForJobDrain = None # Environment producing job to run
+    envJobRunning = False
+    envLockFile = filelock.FileLock(os.path.join(envDirectory, ".jenkinstestrunner.lock"),
+                           timeout=300, delay=sleepInterval)
     myLog = logging.getLogger()
-    while len(allRemainingJobs) > 0 or len(allReadyJobs) or len(allRunningJobs):
-        myLog.debug("Looping with %d remaining jobs" % (len(allRemainingJobs) + len(allReadyJobs)))
-        myLog.debug("Have %d blocked jobs and %d ready jobs" % 
+    myLog.debug("Using lock file '%s'" % (os.path.join(envDirectory, ".jenkinstestrunner.lock")))
+    while len(allRemainingJobs) > 0 or len(allReadyJobs) or len(allRunningJobs) or (waitForJobDrain is not None):
+        myLog.debug("Looping with %d remaining jobs %s" % (len(allRemainingJobs) + len(allReadyJobs),
+                                                           waitForJobDrain is not None and " and %s environment job" % (waitForJobDrain)
+                                                           or ""))
+        myLog.debug("Have %d blocked jobs and %d ready jobs" %
                     (countBlockedJobs, len(allReadyJobs)))
         needWholeMachine = False;
         # Go over the running jobs and see if they
@@ -184,28 +209,100 @@ def mainLoop():
                 if job.getIsTerminalJob():
                     allTerminalJobs.append(job)
         allRunningJobs = tempAllRunning
-    
+
+        if waitForJobDrain is not None:
+            if len(allRunningJobs):
+                if envJobRunning:
+                    myLog.debug("Waiting for environment producing job")
+                else:
+                    myLog.debug("Waiting for %d remaining jobs to drain"
+                                % (len(allRunningJobs)))
+                time.sleep(sleepInterval)
+                continue
+            else:
+                if envJobRunning:
+                    # This means that the environment producing job is done
+                    myLog.info("Environment producing job %s finished" % (waitForJobDrain))
+                    waitForJobDrain = None
+                    envJobRunning = False
+                    # Remove the lock file
+                    envLockFile.release()
+                else:
+                    myLog.info("Running environment producing job %s" % (waitForJobDrain))
+                    while True:
+                        try:
+                            envLockFile.acquire()
+                            break
+                        except filelock.FileLockException:
+                            myLog.error("Environment producing job still on hold...")
+                    returnedStatus = waitForJobDrain.execute()
+                    if (returnedStatus > JobObject.BLOCKED_JOB and
+                        returnedStatus < JobObject.DONE_OK):
+                        myLog.info("Starting %s" % (waitForJobDrain))
+                        envJobRunning = True
+                        allRunningJobs.append(waitForJobDrain)
+                    elif returnedStatus > JobObject.DONE_OK:
+                        # This means the job did not launch properly
+                        myLog.warning("%s failed to launch properly... it will be reported as a failure"
+                                      % (waitForJobDrain))
+                        if waitForJobDrain.getIsTerminalJob():
+                            allTerminalJobs.append(waitForJobDrain)
+                        waitForJobDrain = None
+                        # This next statement should be redundant. Being safe
+                        envJobRunning = False
+                    else:
+                        myLog.error("Status returned by execute not allowed for %s (got %d)"
+                                    % (waitForJobDrain, returnedStatus))
+                        waitForJobDrain = None
+                        envJobRunning = False
+                    continue
+        # End if(waitForJobDrain)
+
+        if waitForJobDrain is not None:
+            # If we are here, it means we still have an environment
+            # producing job so we hold off
+            time.sleep(sleepInterval)
+            continue
+
         # We now go over the jobs that are in allRemainingJobs
         # and distribute them to the other lists as appropriate
         keysToRemove = []
         for k, v in allRemainingJobs.iteritems():
-            if v.getStatus() == JobObject.UNCONFIGURED_JOB:
+            jobStatus = v.getStatus()
+            if (jobStatus == JobObject.UNCONFIGURED_JOB or
+                jobStatus == JobObject.WAITING_JOB):
                 pass
-            elif v.getStatus() == JobObject.WAITING_JOB:
-                pass
-            elif v.getStatus() == JobObject.READY_JOB:
+            elif jobStatus == JobObject.READY_JOB:
                 myLog.info("%s is now ready to run" % (v))
-                keysToRemove.append(k)
-                allReadyJobs.add((-1*(v.getDepth()), v))
-            elif v.getStatus() == JobObject.BLOCKED_JOB:
+                if v.getIsEnvProducer():
+                    assert(waitForJobDrain is None);
+                    keysToRemove.append(k)
+                    waitForJobDrain = v
+                    myLog.info("%s is an environment producing job... Will run alone."
+                               % (v))
+                else:
+                    keysToRemove.append(k)
+                    allReadyJobs.add((-1*(v.getDepth()), v))
+            elif jobStatus == JobObject.BLOCKED_JOB:
                 myLog.warning("%s is now blocked -- it will never run." % (v))
                 keysToRemove.append(k)
                 countBlockedJobs += 1
                 if v.getIsTerminalJob():
                     allTerminalJobs.append(v)
+            else:
+                myLog.warning("Unknown job status for %s: %s" %
+                              (v, str(jobStatus)))
         # Now update the allRemainingJobs
         for k in keysToRemove:
             del allRemainingJobs[k]
+
+        if waitForJobDrain is not None:
+            # If we are here, it means we found an environment
+            # producing job. We loop around to get
+            # it scheduled at the top of the loop
+            # At any rate, we can't schedule any new jobs
+            time.sleep(sleepInterval)
+            continue
 
         # We now have all the jobs in allReadyJobs and
         # we can try to execute them
@@ -217,6 +314,7 @@ def mainLoop():
             if needWholeMachine:
                 break # We can't run any more jobs right now
             myLog.debug("Trying to run %s" % (str(allReadyJobs[i][1])))
+            assert(allReadyJobs[i][1].getIsEnvProducer() is False)
             returnedStatus = allReadyJobs[i][1].execute()
             if returnedStatus > JobObject.BLOCKED_JOB and returnedStatus < JobObject.DONE_OK:
                 myLog.info("Starting %s" % (allReadyJobs[i][1]))
@@ -236,16 +334,16 @@ def mainLoop():
                 myLog.error("Status returned by execute not allowed for %s (got %d)" % (str(allReadyJobs[i][1]), returnedStatus))
                 # I don't really know what to do here. It should never happen
                 allReadyJobs.pop(i)
-    
+
         # At this stage, we have launched all jobs that
         # could be launched. We will sleep before resuming the
         # loop
         time.sleep(sleepInterval)
     # End of while loop on allRemainingJobs
-    
+
 # Main function
 def main(argv=None):
-    global cleanDirectory, sharedRoot, privateRoot, sleepInterval
+    global cleanDirectory, envDirectory, sharedRoot, privateRoot, sleepInterval
     global allRemainingJobs, allJobTypes, allRunningJobs, allReadyJobs, allTerminalJobs
     global allUsedPaths
     global streamHandlerStdOut
@@ -270,10 +368,10 @@ def main(argv=None):
     resultFileName = None
     try:
         try:
-            opts, args = getopt.getopt(argv[1:], "hc:i:s:p:t:k:o:d", ["help", "config=", "initdir=", "shared=",
-                                                                       "private=", "time=", "keyword=", "output=",
-                                                                       "full-help", "debug", "local-only", "no-clean=",
-                                                                       "hier-results"])
+            opts, args = getopt.getopt(argv[1:], "hc:i:e:s:p:t:k:o:d", [
+                "help", "config=", "initdir=", "envdir=", "shared=", "private=",
+                "time=", "keyword=", "output=", "full-help", "debug", "local-only",
+                "no-clean=", "hier-results"])
         except getopt.error, err:
             raise Usage(err)
         for o, a in opts:
@@ -286,6 +384,8 @@ def main(argv=None):
     -c,--config:    Test files to import (without .py extension). The files should contain
                     the description of the tests to run. Can be specified multiple times
     -i,--initdir:   Initial checked-out directory containing the entire GIT tree
+    -e,--envdir:    Environment directory containing pre-built binaries. Persistent
+                    across test runs (should be shared by LUSTRE)
     -s,--shared:    Root directory to use for "shared" workspaces (shared by LUSTRE)
                     Optional if '--local-only' is specified
     -p,--private:   Root directory to use for "private" (local) workspaces
@@ -328,6 +428,14 @@ def main(argv=None):
     It can also optionally specify:
         - timeout:     (int) Number of seconds before a job is killed. If non specified or 0,
                        the job will never timeout
+        - prologue-cmd (string) A script to be run right before the job. This is mostly
+                       useful for remote jobs. On success, this script should return 0.
+                       The system will abort prologue scripts after 5 minutes.
+                       Note that this script runs ONCE even for remote jobs taking up
+                       multiple machines. It will run on the "first" remote node
+        - epilogue-cmd (string) Same as 'prologue-cmd' except it executes after the job
+                       runs. Note that this can be used for cleanup as it will run
+                       even in the case of a failure.
 
     Each job must specify the following arguments:
         - name:        (string) Name of the job (must be unique)
@@ -366,7 +474,7 @@ def main(argv=None):
                             local jobs as the requirements for remote jobs are returned through param-cmd.
             - noSingle:     Can only be specified in a job's sandbox list to over-ride a 'single' in the job type's
                             sandbox list.
-            - local:        Specifies whether this job requires a local home directory (non-shared over LUTRE).
+            - local:        Specifies whether this job requires a local home directory (non-shared over LUSTRE).
                             If specified before 'shared', the initial directory for the job will be the
                             local one. The environment variable JJOB_PRIVATE_HOME will be set to this
                             directory as well as JJOB_START_HOME if this is the starting directory.
@@ -375,6 +483,39 @@ def main(argv=None):
             - shared:       Specifies whether this job requires a shared home directory (shared over LUSTRE).
                             Same comments as for 'local'. Sets JJOB_SHARED_HOME.
             - noShared:     Like 'noLocal' but for 'shared'
+            - writeEnv:     Can only be specified in the job type's sandbox.
+                            Will be prioritized over other jobs and will run
+                            alone to update the environment.
+
+    Environment variables available to the jobs:
+        - JJOB_NAME                   Name of the job running
+        - JJOB_ENVDIR                 Path to the environment directory (always shared)
+        - JJOB_PRIVATE_HOME           Local (non LUSTRE) directory for this job
+                                      if 'local' is specified
+        - JJOB_SHARED_HOME            Shared (LUSTRE) directory for this job if
+                                      'shared' is specified
+        - JJOB_START_HOME             Directory where the job is started.
+                                      One of JJOB_SHARED_HOME or JJOB_PRIVATE_HOME
+                                      depending on the sandbox flags:
+                                        - If only one directory exists, that one is
+                                          used
+                                        - If both 'shared' and 'local' are specified
+                                          will use the PRIVATE_HOME if 'local' is
+                                          specified before 'shared' (and not cancelled
+                                          out by 'noLocal' prior to 'shared')
+        - JJOB_PARENT_PRIVATE_HOME_X  If parent X (X from 0 to number of
+                                      dependences minus 1) has a private
+                                      home, gives the path (otherwise empty).
+                                      This can be the same as JJOB_START_HOME
+                                      and JJOB_PRIVATE_HOME if inheritX is
+                                      set and noCreateRoot or NOT createRoot
+        - JJOB_PARENT_SHARED_HOME_X   Same as JJOB_PARENT_PRIVATE_HOME_X
+                                      for the shared directory. Same comments
+                                      as well
+
+    References:
+        - Prologue error codes for Torque: http://docs.adaptivecomputing.com/torque/4-2-8/help.htm#topics/12-appendices/prologueErrorProc.htm
+        - Prologue and epilogue scripts for Torque: http://docs.adaptivecomputing.com/torque/4-2-8/help.htm#topics/12-appendices/scriptEnvironment.htm
 """)
             elif o in ("-d", "--debug"):
                 streamHandlerStdOut.setLevel(logging.DEBUG)
@@ -415,6 +556,8 @@ def main(argv=None):
                     raise Usage("File '%s' could not be imported" % (a))
             elif o in ("-i", "--initdir"):
                 cleanDirectory = a
+            elif o in ("-e", "--envdir"):
+                envDirectory = a
             elif o in ("-s", "--shared"):
                 sharedRoot = a
             elif o in ("-p", "--private"):
@@ -447,17 +590,26 @@ def main(argv=None):
             raise Usage("Missing checked-out directory")
         else:
             cleanDirectory = os.path.realpath(cleanDirectory)
+
+        if envDirectory is None:
+            raise Usage("Missing environment directory")
+        else:
+            envDirectory = os.path.realpath(envDirectory)
+
         if privateRoot is None:
             raise Usage("Missing private root directory")
         else:
             privateRoot = os.path.realpath(privateRoot)
+
         if runRemoteJobs and (sharedRoot is None):
             raise Usage("Missing shared root directory")
         elif runRemoteJobs:
             sharedRoot = os.path.realpath(sharedRoot)
+
         if sleepInterval is None:
             myLog.warning("Sleep interval not specified... assuming 5 seconds")
             sleepInterval = 5
+
         if resultFileName is None:
             myLog.warning("No output filename specified, results will be dumped to stdout")
         else:
@@ -466,6 +618,7 @@ def main(argv=None):
         # Check if we will have circular copy issues
         if privateRoot.startswith(cleanDirectory):
             raise Usage("The private root directory cannot be within the checked-out directory")
+
         if sharedRoot and sharedRoot.startswith(cleanDirectory):
             raise Usage("The shared root directory cannot be within the checked-out directory")
     except Usage, msg:
@@ -474,22 +627,34 @@ def main(argv=None):
         return 2
 
     # Set the globals
-    JobObject.setGlobals(cleanDirectory=cleanDirectory, sharedRoot=sharedRoot,
-                         privateRoot=privateRoot, allUsedPaths=allUsedPaths, runRemoteJobs=runRemoteJobs)
+    JobObject.setGlobals(cleanDirectory=cleanDirectory, envDirectory=envDirectory,
+                         sharedRoot=sharedRoot, privateRoot=privateRoot,
+                         allUsedPaths=allUsedPaths, runRemoteJobs=runRemoteJobs)
 
     try:
         # At this point we have all the job types and we can do other checks
         # and create the jobs
-        # TODO: We need to check keywords around here
+        # First step: check the keywords
+        toRemoveKeys = []
         for k, v in tempJobs.iteritems():
             jobType = allJobTypes.get(v['jobtype'])
             if jobType is None:
                 raise Usage("JobObject '%s' uses a job type '%s' which is not defined" % (k, v['jobtype']))
+            if not hasKeywords(jobType.keywords, testKeywords, True):
+                myLog.info("Ignoring job %s due to keyword restrictions" % (v['name']))
+                toRemoveKeys.append(k)
+        for k in toRemoveKeys:
+            del tempJobs[k]
+
+        for k, v in tempJobs.iteritems():
+            jobType = allJobTypes.get(v['jobtype'])
+            # Check happened before
+            assert(jobType is not None)
             if jobType.isLocal:
                 allRemainingJobs[k] = LocalJobObject(v, jobType, len(v['depends']))
             else:
                 allRemainingJobs[k] = TorqueJobObject(v, jobType, len(v['depends']))
-                
+
         # Do another loop to set up the dependences properly
         for k, v in tempJobs.iteritems():
             if len(v['depends']):
@@ -516,20 +681,26 @@ def main(argv=None):
     myLog.info("---- Initializing ---")
     # Build the initial list of ready jobs
     totalJobCount = len(allRemainingJobs)
+    haveReadyJob = False
     toRemoveKeys = []
     for k, v in allRemainingJobs.iteritems():
         if v.getStatus() == JobObject.READY_JOB:
-            myLog.info("%s is initially ready to run" % (str(v)))
-            allReadyJobs.add((-1*(v.getDepth()), v))
-            toRemoveKeys.append(k)
+            haveReadyJob = True
+            if v.getIsEnvProducer():
+                myLog.info("%s is an environment producing job initially ready to run" % (str(v)))
+                # We don't put in allReadyJobs. See mainLoop
+            else:
+                myLog.info("%s is initially ready to run" % (str(v)))
+                allReadyJobs.add((-1*(v.getDepth()), v))
+                toRemoveKeys.append(k)
     # Remove things from allRemainingJobs
     for k in toRemoveKeys:
         del allRemainingJobs[k]
 
-    if len(allReadyJobs) == 0:
+    if not haveReadyJob:
         myLog.error("No jobs are initially ready, nothing to execute")
         return 0 # This may not be an "error" as such if no jobs match the keywords
-    
+
     startTime = datetime.now()
     myLog.info("---- Starting jobs (have %d total jobs) @ %s ----" %
                (totalJobCount, str(startTime)))
@@ -537,7 +708,7 @@ def main(argv=None):
     endTime = datetime.now()
     myLog.info("---- Finished jobs (took %d seconds, %d terminal jobs; %d could not run), now cleaning up ----" %
                ((endTime - startTime).seconds, len(allTerminalJobs), countBlockedJobs))
-    
+
     # Output results
     allTestSuites = [job.getTestSuite() for job in allTerminalJobs]
     if resultFileName:
@@ -555,7 +726,7 @@ def main(argv=None):
         if keepDirs == KEEP_FAILURE:
             # We only keep if there is a failure
             if v[2] > 0:
-                myLog.info("Keeping work directory '%s' due to %d jobs failing in it" 
+                myLog.info("Keeping work directory '%s' due to %d jobs failing in it"
                            % (k, v[2]))
                 doRemove = False
         elif keepDirs == KEEP_ALL:
@@ -570,4 +741,3 @@ def main(argv=None):
 # Starts the program
 if __name__ == '__main__':
     sys.exit(main())
-

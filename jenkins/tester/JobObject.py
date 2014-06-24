@@ -85,7 +85,7 @@ class JobTypeObject(object):
     """
     def __init__(self, inputDict):
         """Creates a new job type. The parameters are:
-               - inputDict is a dictionary with 'name', 'keywords', 'isLocal', 
+               - inputDict is a dictionary with 'name', 'keywords', 'isLocal',
                  'run-cmd', 'param-cmd', 'sandbox' and optionally 'timeout'
         """
         # Public variables (to avoid getter/setter)
@@ -94,15 +94,18 @@ class JobTypeObject(object):
         self.isLocal = inputDict['isLocal']
         self.run_cmd = inputDict['run-cmd']
         self.param_cmd = inputDict['param-cmd']
+        self.prologue_cmd = inputDict.get('prologue-cmd', "")
+        self.epilogue_cmd = inputDict.get('epilogue-cmd', "")
         self.sandbox = inputDict['sandbox']
         self.timeout = inputDict.get('timeout', 0) # Defaults to 0
+
 
         self._myLog = logging.getLogger()
 
         # Check the sandbox keywords
         cleanSandbox = []
         for val in self.sandbox:
-            if val in ('createRoot', 'shareOK', 'single', 'local', 'shared'):
+            if val in ('createRoot', 'shareOK', 'single', 'local', 'shared', 'writeEnv'):
                 cleanSandbox.append(val)
             else:
                 self._myLog.warning("%s specifies invalid sandbox parameter '%s'... ignoring" % (str(self), val))
@@ -132,7 +135,7 @@ class JobObject(object):
     DONE_FAIL_LAUNCH = 0x41 # JobObject failed to launch
     DONE_FAIL_RUN    = 0x42 # JobObject failed to complete
     DONE_FAIL_STATUS = 0x43 # JobObject ran and completed with a non-zero status
-    
+
     @classmethod
     def setGlobals(cls, **globals):
         for k, v in globals.iteritems():
@@ -152,13 +155,13 @@ class JobObject(object):
         self.param_args = inputDict.get('param-args', "")
         self.timeout = inputDict.get('timeout', None)
         self.jobType = jobType
-        
+
         # These three variables are used when the process starts running
         self._outFile = None    # Out file to be used when this job executes
         self._errFile = None    # Err file to be used when this job executes
         self._startTime = None  # Time the process started running
         self._endTime   = None  # Time the process ended running
-        
+
         # Private variables
 
         # First the rest of the configuration variables
@@ -190,7 +193,7 @@ class JobObject(object):
 
         self._recomputeStatus = False # True if status needs to be updated
         self._recomputeDirs = True    # True if _dirs needs to be updated
-        self._dirs = {'private': None, 'shared': None, 
+        self._dirs = {'private': None, 'shared': None,
                       'copy-private': None, 'copy-shared': None,} # Cached directory information
 
         # Variables used to determine how to build the directories
@@ -202,6 +205,7 @@ class JobObject(object):
         self._requirePrivateRoot = -2 # Do not require a private root
         self._startInShared = False
         self._newDirectory = False # Will be true if a new directory needs to be created
+        self._envProducer = False  # Will be true if this job produces an environment
 
         # Very simple propagation of values
         if self._sandbox is None:
@@ -212,7 +216,7 @@ class JobObject(object):
             self.timeout = jobType.timeout
 
         # Parse the sandbox information
-        self._parseSandbox()        
+        self._parseSandbox()
 
         self._myLog.debug("Created a JobObject for %s" % (str(self)))
 
@@ -240,25 +244,25 @@ class JobObject(object):
             self._propagateDepthInfo()
         self._myLog.debug("%s now has depth %d" % (str(self), self._depth))
         return True
-    
+
     def addDependence(self, signalingJob):
         """Adds a job to the list of dependence.
            Returns the slot used for this dependence
         """
         assert(self._lastDependenceSet < len(self._dependence))
-        self._dependence[self._lastDependenceSet] = Dependence(signalingJob, 
+        self._dependence[self._lastDependenceSet] = Dependence(signalingJob,
                                                                self._lastDependenceSet)
         self._myLog.debug("%s depends on %s at slot %d" % (
             str(self), str(signalingJob), self._lastDependenceSet))
         self._lastDependenceSet += 1
         self._recomputeStatus = True # Status will need to be recomputed
         return self._lastDependenceSet - 1
-        
+
     def satisfyDependence(self, signalingJob, slot):
         """Notifies this job that a dependence is satisfied"""
         self._myLog.debug("Satisfying dependence slot %d of %s with %s" % (slot, str(self), str(signalingJob)))
         assert(self._dependence[slot].job == signalingJob)
-        
+
         self._dependence[slot].setStatus((Dependence.SUCCESS if signalingJob.getStatus() == JobObject.DONE_OK else Dependence.FAIL))
         self._recomputeStatus = True
         self._updateStatus()
@@ -286,7 +290,7 @@ class JobObject(object):
         if depth > self._depth:
             self._depth = depth
             self._propagateDepthInfo()
-            
+
     def getDepth(self):
         """Returns the depth"""
         return self._depth
@@ -297,10 +301,26 @@ class JobObject(object):
             self._updateStatus()
         assert(not self._recomputeStatus)
         return self._jobStatus
-    
+
     def getIsWholeMachine(self):
         """Returns true if this job requires the entire local machine"""
         return self._wholeMachine
+
+    def getIsEnvProducer(self):
+        """Returns true if this job produces the env dir"""
+        return self._envProducer
+
+    def hasKeywords(self, keywords, allKeywords):
+        """Returns true if this job matches the keywords passed in;
+        either all of them if allKeywords is true or any of them otherwise"""
+        myKw = frozenset(self.keywords)
+        theirKw = frozenset(keywords)
+        if allKeywords:
+            # Test for subset
+            return theirKw <= myKw
+        else:
+            # Check length of intersection
+            return len(myKw & theirKw) > 0
 
     def getIsTerminalJob(self):
         """Returns true if this is a "terminal" job (ie: no other job
@@ -330,7 +350,7 @@ class JobObject(object):
             return self._dirs
 
         self._dirs['private'] = self._dirs['shared'] = self._dirs['copy-private'] = self._dirs['copy-shared'] = None
-        
+
         inheritFrom = max(self._requirePrivateRoot, self._requireSharedRoot)
         if inheritFrom >= 0:
             dirs = self._dependence[inheritFrom].job.getDirectories()
@@ -342,7 +362,7 @@ class JobObject(object):
             if self._newDirectory:
                 self._dirs['private'] = ""
                 self._dirs['copy-private'] = JobObject.cleanDirectory if inheritFrom is None else inheritFrom[0]
-                self._dirs['copy-private'] = self._checkForNoneDir(self._dirs['copy-private'], 
+                self._dirs['copy-private'] = self._checkForNoneDir(self._dirs['copy-private'],
                                                                    inheritFrom[1], ("private", "shared"))
             else:
                 if inheritFrom is None:
@@ -363,7 +383,7 @@ class JobObject(object):
             if self._newDirectory:
                 self._dirs['shared'] = ""
                 self._dirs['copy-shared'] = JobObject.cleanDirectory if inheritFrom is None else inheritFrom[1]
-                self._dirs['copy-shared'] = self._checkForNoneDir(self._dirs['copy-shared'], 
+                self._dirs['copy-shared'] = self._checkForNoneDir(self._dirs['copy-shared'],
                                                                    inheritFrom[0], ("shared", "private"))
             else:
                 if inheritFrom is None:
@@ -392,7 +412,7 @@ class JobObject(object):
         """
         self._myLog.error("%s needs to define its own execute!!" % (str(self)))
         assert(False)
-            
+
     def poll(self):
         """Checks if the job finished executing.
            This will return True if the job is done
@@ -400,8 +420,8 @@ class JobObject(object):
         """
         self._myLog.error("%s needs to define its own poll!!" % (str(self)))
         assert(False)
-        
-        
+
+
     def signalJobDone(self, returnCode, releaseDirs, errString = None):
         """Called when the job finished executing. Updates everything
            and triggers any dependence
@@ -424,7 +444,7 @@ class JobObject(object):
                 outputFile = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
             except subprocess.CalledProcessError:
                 self._myLog.warning("Could not get output file for %s... ignoring" % (str(self)))
-            
+
             outputFile = outputFile.strip()
             if len(outputFile) == 0:
                 outputFile = None
@@ -433,16 +453,16 @@ class JobObject(object):
                 self._myLog.debug("%s got output file '%s'" % (str(self), outputFile))
             else:
                 self._myLog.debug("%s has no defined output file" % (str(self)))
-            
+
             if outputFile is not None and (not os.path.isfile(outputFile) or not os.path.isabs(outputFile)):
                 self._myLog.warning("Output file '%s' for %s is not a valid file or not an absolute path... ignoring result" %
                                     (outputFile, str(self)))
                 outputFile = None
-            
+
             if outputFile:
                 testCases[1] = TestCasesFile(outputFile)
-            
-            testCases[0] = TestCase("_main_" + self.name, self.name, 
+
+            testCases[0] = TestCase("_main_" + self.name, self.name,
                                     (self._endTime - self._startTime).total_seconds(),
                                     self._outFile.read(-1).decode('utf-8'), self._errFile.read(-1).decode('utf-8'))
             self._jobStatus = JobObject.DONE_OK
@@ -473,7 +493,7 @@ class JobObject(object):
             self._errFile.close()
 
         self._outFile = self._errFile = None
-        
+
         # Update the test suite
         self._testSuite.add_test_case(testCases[0])
         if testCases[1] is not None:
@@ -481,7 +501,7 @@ class JobObject(object):
         # Merge this test suite with the ones in the history
         for dep in self._dependence:
             self._testSuite.merge_cases(dep.job._testSuite)
-        
+
         # Notify all waiters
         for v in self._waiters.itervalues():
             v[0].satisfyDependence(self, v[1])
@@ -489,7 +509,7 @@ class JobObject(object):
         # Release hold on directories
         if releaseDirs:
             self._releaseJobDirectories(returnCode <> 0)
-        
+
     def _parseSandbox(self):
         inheritDirFrom = None
         for criteria in self._sandbox:
@@ -530,6 +550,8 @@ class JobObject(object):
             elif criteria == "noShared":
                 self._requireSharedRoot = -2
                 self._startInShared = False # No share, so start in private for sure
+            elif criteria == "writeEnv":
+                self._envProducer = True
             else:
                 self._myLog.warning("%s specifies unknown criteria in sandbox ('%s') ... ignoring." % (str(self), criteria))
         # end for over self.sandbox
@@ -563,7 +585,7 @@ class JobObject(object):
                 # For other dependences we don't care since
                 # they have already fired away
                 dep.job.updateDepth(self._depth + 1)
-        
+
     def _updateStatus(self):
         if not (self._jobStatus & 0xF0):
             self._jobStatus = None
@@ -582,7 +604,7 @@ class JobObject(object):
                 self._jobStatus = JobObject.READY_JOB # Nothing happened so we are all good
         #end if
         self._recomputeStatus = False
-    
+
     def _checkForNoneDir(self, directory, otherOption, errorNames):
         if directory is None:
             self._myLog.warning("%s needs a %s directory from its parent; not found so using a %s directory." %
@@ -605,7 +627,7 @@ class JobObject(object):
 
         self._myLog.debug("Directories for %s will be '%s' (non LUSTRE) and '%s' (LUSTRE)" %
                           (str(self), self._dirs['private'], self._dirs['shared']))
-    
+
     def _copyJobDirectories(self):
         """This copies any data into the job directories if required"""
         self._myLog.debug("Starting directory copies...")
@@ -649,7 +671,7 @@ class JobObject(object):
             else:
                 # We update the information
                 JobObject.allUsedPaths[self._dirs['private']] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1, usedInfo[2])
-                self._myLog.debug("%s sharing non-LUSTRE '%s' with %d other jobs" % 
+                self._myLog.debug("%s sharing non-LUSTRE '%s' with %d other jobs" %
                                   (str(self), self._dirs['private'], usedInfo[1]))
         # Now check the shared directory
         if self._dirs['shared'] is not None:
@@ -671,7 +693,7 @@ class JobObject(object):
             else:
                 # We update the information
                 JobObject.allUsedPaths[jobDirs[1]] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1, usedInfo[2])
-                self._myLog.debug("%s sharing LUSTRE '%s' with %d other jobs" % 
+                self._myLog.debug("%s sharing LUSTRE '%s' with %d other jobs" %
                                   (str(self), self._dirs['shared'], usedInfo[1]))
         return True
 
@@ -700,6 +722,7 @@ class JobObject(object):
         env['JJOB_PRIVATE_HOME'] = self._dirs['private'] if self._dirs['private'] is not None else ""
         env['JJOB_SHARED_HOME'] = self._dirs['shared'] if self._dirs['shared'] is not None else ""
         env['JJOB_START_HOME'] = env['JJOB_SHARED_HOME'] if self._startInShared else env['JJOB_PRIVATE_HOME']
+        env['JJOB_ENVDIR'] = JobObject.envDirectory
         id = 0
         for dep in self._dependence:
             parentDirs = dep.job.getDirectories()
@@ -725,20 +748,20 @@ class JobObject(object):
 
 class LocalJobObject(JobObject):
     """A job that executes on the local machine"""
-    
+
     def execute(self):
         """Executes the job locally"""
         if self._recomputeStatus:
             self._updateStatus()
         if self._recomputeDirs:
             self.getDirectories()
-        
+
         if self._jobStatus == JobObject.READY_JOB:
-                
+
             self._myLog.info("Launching local job %s of type %s" % (str(self), str(self.jobType)))
             # First we create the environment for the job
             self._createJobDirectories()
-                
+
             # We now check if the directories are OK to run in
             if not self._grabJobDirectories():
                 # We don't actually need to destroy any directories since
@@ -750,23 +773,36 @@ class LocalJobObject(JobObject):
             self._copyJobDirectories()
 
             # Set up the environment
-            myEnv = self._getEnvironment()
+            myEnv = origEnv = self._getEnvironment()
+            myEnv.update(os.environ)
+            myEnv['PYTHONIOENCODING'] = 'utf-8'
 
             # Create files for the error and output streams
             self._outFile = tempfile.TemporaryFile(mode="w+b", suffix="out", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
             self._errFile = tempfile.TemporaryFile(mode="w+b", suffix="err", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
-                                                
+
+
+            # Run the prologue script
+            if len(self.jobType.prologue_cmd):
+                cmdLine = Template(self.jobType.prologue_cmd)
+                cmdLine = cmdLine.substitute(origEnv)
+                args = shlex.split(cmdLine)
+                self._myLog.debug("%s will run prologue with: %s" % (str(self), str(args)))
+                try:
+                    subprocess.check_call(args, cwd=myEnv['JJOB_START_HOME'],
+                                          env=myEnv, shell=False)
+                except subprocess.CalledProcessError:
+                    self._myLog.error("Could not run the prologue for %s" % (self))
+            # Now go and run the executable
             # Form the command line
             cmdLine = Template(self.jobType.run_cmd + " " + self.run_args)
-            cmdLine = cmdLine.substitute(myEnv) # Allow user to use JJOB_* macros
+            cmdLine = cmdLine.substitute(origEnv) # Allow user to use JJOB_* macros
             args = shlex.split(cmdLine)
-            
-            myEnv.update(os.environ)
-            myEnv['PYTHONIOENCODING'] = 'utf-8'
+
             self._myLog.debug("%s will execute with: %s" % (str(self), str(args)))
-    
+
             self._startTime = datetime.now()
             self._process = subprocess.Popen(args, stdout=self._outFile, stderr=self._errFile,
                                              cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
@@ -774,6 +810,23 @@ class LocalJobObject(JobObject):
             return JobObject.RUNNING_LOCAL
         else:
             return self._jobStatus
+
+    def _cleanUp(self):
+        """Function to clean up the local job by running the
+        epilogue script if needed"""
+        if len(self.jobType.epilogue_cmd):
+            myEnv = self._getEnvironment()
+            cmdLine = Template(self.jobType.epilogue_cmd)
+            cmdLine = cmdLine.substitute(origEnv)
+            args = shlex.split(cmdLine)
+            self._myLog.debug("%s will run epilogue with: %s" % (str(self), str(args)))
+            myEnv.update(os.environ)
+            myEnv['PYTHONIOENCODING'] = 'utf-8'
+            try:
+                subprocess.check_call(args, cwd=myEnv['JJOB_START_HOME'],
+                                      env=myEnv, shell=False)
+            except subprocess.CalledProcessError:
+                self._myLog.error("Could not run the epilogue for %s" % (self))
 
     def poll(self):
         """Function to check whether a job has finished and if
@@ -794,11 +847,13 @@ class LocalJobObject(JobObject):
                     self._myLog.info("%s timed-out... Killing" % (str(self)))
                     self._process.kill()
                     self._process.wait()
+                    # Run the epilogue script if it exists
+                    self._cleanUp()
                     self.signalJobDone(-1, True, "Local job timed-out")
                     self._process = None
                     return True
                 else:
-                    self._myLog.debug("%s allowed to continue, ran for %d seconds but has %d seconds" % 
+                    self._myLog.debug("%s allowed to continue, ran for %d seconds but has %d seconds" %
                                       (str(self), (now - self._startTime).seconds, self.timeout))
             else:
                 self._myLog.debug("%s allowed to continue, ran for %d seconds and does not have a timeout" %
@@ -807,6 +862,7 @@ class LocalJobObject(JobObject):
             # JobObject finished
             self._myLog.info("%s finished running and returned %d" % (str(self), returnCode))
             self._endTime = datetime.now()
+            self._cleanUp()
             self.signalJobDone(returnCode, True)
             self._process = None
             return True
@@ -815,27 +871,27 @@ class LocalJobObject(JobObject):
 
 class TorqueJobObject(JobObject):
     """A job that executes using the Torque job scheduler"""
-    
+
     def execute(self):
         """Executes the job using Torque"""
         if self._recomputeStatus:
             self._updateStatus()
         if self._recomputeDirs:
             self.getDirectories()
-        
+
         if JobObject.runRemoteJobs == False:
             self._myLog.info("Remote job %s cannot launch because only local jobs are being run" %
                              (str(self)))
             self.signalJobDone(-1, False, "Only local jobs are enabled")
             self._jobStatus = JobObject.DONE_FAIL_LAUNCH
             return self._jobStatus
-            
+
         if self._jobStatus == JobObject.READY_JOB:
-                
+
             self._myLog.info("Launching remote job %s of type %s" % (str(self), str(self.jobType)))
             # First we create the environment for the job
             self._createJobDirectories()
-                
+
             # We now check if the directories are OK to run in
             if not self._grabJobDirectories():
                 # We don't actually need to destroy any directories since
@@ -847,18 +903,18 @@ class TorqueJobObject(JobObject):
             self._copyJobDirectories()
 
             # Set up the environment
-            myEnv = self._getEnvironment()
+            myEnv = origEnv = self._getEnvironment()
+            myEnv.update(os.environ)
+            myEnv['PYTHONIOENCODING'] = 'utf-8'
 
             # We need to create the arguments for Qsub
             # Get the string of required resources
             cmdLine = Template(self.jobType.param_cmd + " resources " + self.param_args)
-            cmdLine = cmdLine.substitute(myEnv)
+            cmdLine = cmdLine.substitute(origEnv)
             args = shlex.split(cmdLine)
             self._myLog.debug("%s getting resources for Torque job with command '%s'" % (str(self), str(args)))
             resourceString = None
 
-            myEnv.update(os.environ)
-            myEnv['PYTHONIOENCODING'] = 'utf-8'
             try:
                 resourceString = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
             except subprocess.CalledProcessError:
@@ -866,24 +922,52 @@ class TorqueJobObject(JobObject):
                 self._startTime = self._endTime = datetime.now()
                 self.signalJobDone(-2, True, "Remote job could not get resource list")
                 return self._jobStatus
+
+            # Update the resourceString with the prologue and epilogue commands
+            resourceString = resourceString.strip()
+            resourceStringNew = re.sub(r"prologue=[^,]*(,|$)", r"",
+                                       resourceString).strip(',')
+            if len(resourceStringNew) <> len(resourceString):
+                self._myLog.warning("Stripping prologue resource spec from %s"
+                                    % (self))
+            resourceString = resourceStringNew
+
+            resourceStringNew = re.sub(r"epilogue=[^,]*(,|$)", r"",
+                                       resourceString).strip(',')
+            if len(resourceStringNew) <> len(resourceString):
+                self._myLog.warning("Stripping epilogue resource spec from %s"
+                                    % (self))
+            resourceString = resourceStringNew
+
+            if len(self.jobType.prologue_cmd):
+                cmdLine = Template(self.jobType.prologue_cmd)
+                cmdLine = cmdLine.substitute(origEnv)
+                resourceString = resourceString + ",prologue=%s" % (cmdLine)
+            if len(self.jobType.epilogue_cmd):
+                cmdLine = Template(self.jobType.epilogue_cmd)
+                cmdLine = cmdLine.substitute(origEnv)
+                resourceString = resourceString + ",epilogue=%s" % (cmdLine)
+
             # We deal with the walltime resource requirement because that's
             # how we add the timeout requirement
             resourceString = resourceString.strip()
-            resourceStringNew = re.sub(r"walltime=[^,]*(,|$)", r"", resourceString).strip(',')
+            resourceStringNew = re.sub(r"walltime=[^,]*(,|$)", r"",
+                                       resourceString).strip(',')
             if len(resourceStringNew) <> len(resourceString):
                 self._myLog.warning("Stripping walltime resource restrictions from %s... added by timeout option" % (str(self)))
 
+            resourceString = resourceStringNew
             # Set the timeout
             if self.timeout > 0:
                 self._myLog.debug("%s has a timeout, adding walltime restriction to Torque job (%d seconds)" % (str(self), self.timeout))
-                resourceString = resourceStringNew + ",walltime=%d" % (self.timeout)
-            
+                resourceString = resourceString + ",walltime=%d" % (self.timeout)
+
             # Create files for the error and output streams
             self._outFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="out", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
             self._errFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="err", prefix="jjob_" + self.name + "_",
                                                    dir="/tmp")
-            
+
             # Form the argument to qsub
             argCmd = ['/usr/local/bin/qsub', '-d', myEnv['JJOB_START_HOME'],
                       '-e', self._errFile.name, '-j', 'n', '-k', 'n', '-l',
@@ -909,14 +993,14 @@ class TorqueJobObject(JobObject):
 
             argCmd.append(self._scriptFile.name)
             self._myLog.debug("%s will execute remotely with: %s" % (str(self), str(argCmd)))
-            
+
             self._startTime = datetime.now()
             self._jobNumber = None
             try:
                 self._jobNumber = subprocess.check_output(argCmd, cwd=myEnv['JJOB_START_HOME'],
                                                           env=myEnv, shell=False)
             except subprocess.CalledProcessError, err:
-                self._myLog.error("Could not launch QSub command for %s... (error '%s' code %d) aborting" % 
+                self._myLog.error("Could not launch QSub command for %s... (error '%s' code %d) aborting" %
                                   (str(self), err.output, err.returncode))
                 self._myLog.error("Command was %s" % (str(argCmd)))
                 self._scriptFile.close() # This will remove this test file
@@ -927,7 +1011,7 @@ class TorqueJobObject(JobObject):
             # Here we have the job number
             self._jobNumber = self._jobNumber.strip()
             self._myLog.debug("%s was added to the Torque job queue with ID '%s'" % (str(self), self._jobNumber))
-            
+
             return JobObject.RUNNING_REMOTE
         else:
             return self._jobStatus
@@ -941,7 +1025,7 @@ class TorqueJobObject(JobObject):
         stateCompleteMatch = re.compile("job_state = ([CEHQRTWS])$", re.MULTILINE)
         statusCheckMatch = re.compile("exit_status = ([0-9]+)$", re.MULTILINE)
         timeCheckMatch = re.compile("resources_used.walltime = ([0-9:]+)$", re.MULTILINE)
-        
+
         pollArgs = ['/usr/local/bin/qstat', '-f', self._jobNumber]
         self._myLog.debug("%s: Checking for job completion with '%s'" % (str(self), str(pollArgs)))
         pollOutput = None
@@ -950,7 +1034,7 @@ class TorqueJobObject(JobObject):
         except subprocess.CalledProcessError:
             self._myLog.debug("%s: Job trace not yet available... will retry" % (str(self)))
             return False
-        
+
         # Now we can check if we have a completed job
         self._endTime = now = datetime.now()
 
@@ -986,7 +1070,7 @@ class TorqueJobObject(JobObject):
                     curStatus = "being held"
                 else:
                     curStatus = "in a weird state"
-            self._myLog.debug("%s is %s, ran for %d seconds" % 
+            self._myLog.debug("%s is %s, ran for %d seconds" %
                               (str(self), curStatus,
                                (now - self._startTime).seconds))
         return False
