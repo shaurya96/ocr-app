@@ -3,6 +3,7 @@
 import logging, os, re, shlex, shutil, subprocess, tempfile
 from datetime import datetime, timedelta
 from junit_xml import TestCase, TestCasesFile, TestSuite
+from stat import *
 from string import Template
 
 def mycopytree(src, dest):
@@ -86,7 +87,8 @@ class JobTypeObject(object):
     def __init__(self, inputDict):
         """Creates a new job type. The parameters are:
                - inputDict is a dictionary with 'name', 'keywords', 'isLocal',
-                 'run-cmd', 'param-cmd', 'sandbox' and optionally 'timeout'
+                 'run-cmd', 'param-cmd', 'sandbox' and optionally 'timeout',
+                 'prologue-cmd', 'epilogue-cmd', and 'env-vars'
         """
         # Public variables (to avoid getter/setter)
         self.name = inputDict['name']
@@ -98,6 +100,7 @@ class JobTypeObject(object):
         self.epilogue_cmd = inputDict.get('epilogue-cmd', "")
         self.sandbox = inputDict['sandbox']
         self.timeout = inputDict.get('timeout', 0) # Defaults to 0
+        self.env_vars = inputDict.get('env-vars', {}).copy() # Defaults to empty dir
 
 
         self._myLog = logging.getLogger()
@@ -105,7 +108,8 @@ class JobTypeObject(object):
         # Check the sandbox keywords
         cleanSandbox = []
         for val in self.sandbox:
-            if val in ('createRoot', 'shareOK', 'single', 'local', 'shared', 'writeEnv'):
+            if val in ('single', 'shareOK', 'writeEnv', 'local', 'shared', 'emptyShared', 'copyShared',
+                       'emptyLocal', 'copyLocal'):
                 cleanSandbox.append(val)
             else:
                 self._myLog.warning("%s specifies invalid sandbox parameter '%s'... ignoring" % (str(self), val))
@@ -144,7 +148,8 @@ class JobObject(object):
     def __init__(self, inputDict, jobType, dependenceCount):
         """Create a new job. The parameters are:
             - inputDict is a dictionary with 'name', 'run-args',
-              and optionally 'sandbox' and 'timeout'
+              'param-args' and optionally 'sandbox', 'timeout',
+              and 'env-vars'
             - jobType is an object of type JobTypeObject
             - dependenceCount is the number of dependences
         """
@@ -154,6 +159,8 @@ class JobObject(object):
         self.run_args = inputDict['run-args']
         self.param_args = inputDict.get('param-args', "")
         self.timeout = inputDict.get('timeout', None)
+        self.env_vars = jobType.env_vars.copy() # We take what jobType has and override things
+        self.env_vars.update(inputDict.get('env-vars', {}))
         self.jobType = jobType
 
         # These three variables are used when the process starts running
@@ -203,6 +210,9 @@ class JobObject(object):
         # other number, the dependence from which we inherit the directory
         self._requireSharedRoot = -2  # Do not require a shared root
         self._requirePrivateRoot = -2 # Do not require a private root
+        # For the next two variables OR value of : 0 (default), 1 (empty), 2 (same directory), 4 (copy)
+        self._modeSharedRoot = 0
+        self._modePrivateRoot = 0
         self._startInShared = False
         self._newDirectory = False # Will be true if a new directory needs to be created
         self._envProducer = False  # Will be true if this job produces an environment
@@ -359,46 +369,56 @@ class JobObject(object):
             inheritFrom = None
 
         if self._requirePrivateRoot > -2:
-            if self._newDirectory:
+            if self._modePrivateRoot == 1:
                 self._dirs['private'] = ""
-                self._dirs['copy-private'] = JobObject.cleanDirectory if inheritFrom is None else inheritFrom[0]
-                self._dirs['copy-private'] = self._checkForNoneDir(self._dirs['copy-private'],
+            elif self._modePrivateRoot == 2:
+                assert(inheritFrom is not None)
+                self._dirs['private'] = inheritFrom[0]
+                # Check if it doesn't exist and if so, use the shared copy
+                # Need to copy to deal with base path issues
+                self._dirs['copy-private'] = self._checkForNoneDir(self._dirs['private'],
                                                                    inheritFrom[1], ("private", "shared"))
-            else:
-                if inheritFrom is None:
+                if self._dirs['private'] is None:
                     self._dirs['private'] = ""
-                    # Copy only if using clean directory
-                    self._dirs['copy-private'] = JobObject.cleanDirectory
-                elif inheritFrom[0] is not None:
-                    # Simple case where we just use the parent's directory
-                    self._dirs['private'] = inheritFrom[0]
                 else:
-                    # Here we use the parent's shared directory and copy it
-                    # The copy is required to deal with base path issues
-                    assert(inheritFrom[1])
-                    self._dirs['private'] = ""
-                    self._dirs['copy-private'] = inheritFrom[1]
+                    self._dirs['copy-private'] = None
+            elif self._modePrivateRoot == 4:
+                self._dirs['private'] = ""
+                if inheritFrom is None:
+                    self._dirs['copy-private'] = JobObject.cleanDirectory
+                else:
+                    self._dirs['copy-private'] = inheritFrom[0]
+                    self._dirs['copy-private'] = self._checkForNoneDir(self._dirs['copy-private'],
+                                                                       inheritFrom[1],
+                                                                       ("private", "shared"))
+            else:
+                assert(False);
 
         if self._requireSharedRoot > -2:
-            if self._newDirectory:
+            if self._modeSharedRoot == 1:
                 self._dirs['shared'] = ""
-                self._dirs['copy-shared'] = JobObject.cleanDirectory if inheritFrom is None else inheritFrom[1]
-                self._dirs['copy-shared'] = self._checkForNoneDir(self._dirs['copy-shared'],
-                                                                   inheritFrom[0], ("shared", "private"))
-            else:
-                if inheritFrom is None:
+            elif self._modeSharedRoot == 2:
+                assert(inheritFrom is not None)
+                self._dirs['shared'] = inheritFrom[1]
+                # Check if it doesn't exist and if so, use the shared copy
+                # Need to copy to deal with base path issues
+                self._dirs['copy-shared'] = self._checkForNoneDir(self._dirs['shared'],
+                                                                  inheritFrom[0], ("shared", "private"))
+                if self._dirs['shared'] is None:
                     self._dirs['shared'] = ""
-                    # Copy only if using clean directory
-                    self._dirs['copy-shared'] = JobObject.cleanDirectory
-                elif inheritFrom[1] is not None:
-                    # Simple case where we just use the parent's directory
-                    self._dirs['shared'] = inheritFrom[1]
                 else:
-                    # Here we use the parent's private directory and copy it
-                    # The copy is required to deal with base path issues
-                    assert(inheritFrom[1])
-                    self._dirs['shared'] = ""
-                    self._dirs['copy-shared'] = inheritFrom[0]
+                    self._dirs['copy-shared'] = None
+            elif self._modeSharedRoot == 4:
+                self._dirs['shared'] = ""
+                if inheritFrom is None:
+                    self._dirs['copy-shared'] = JobObject.cleanDirectory
+                else:
+                    self._dirs['copy-shared'] = inheritFrom[1]
+                    self._dirs['copy-shared'] = self._checkForNoneDir(self._dirs['copy-shared'],
+                                                                      inheritFrom[0],
+                                                                      ("shared", "private"))
+            else:
+                assert(False);
 
         self._recomputeDirs = False
         self._myLog.debug("%s's initial directories are %s" % (str(self), str(self._dirs)))
@@ -427,8 +447,10 @@ class JobObject(object):
            and triggers any dependence
         """
         self._recomputeStatus = True
-        self._outFile.seek(0) # Go back to the beginning of the files
-        self._errFile.seek(0)
+        if self._outFile is not None:
+            self._outFile.seek(0) # Go back to the beginning of the files
+        if self._errFile is not None:
+            self._errFile.seek(0)
         testCases = [None, None]
         if returnCode == 0:
             # We check whether we have an output file to use for the result
@@ -438,7 +460,6 @@ class JobObject(object):
             args = shlex.split(cmdLine)
             self._myLog.debug("%s getting output file with command '%s'" % (str(self), str(args)))
             outputFile = None
-            myEnv.update(os.environ)
             myEnv['PYTHONIOENCODING'] = 'utf-8'
             try:
                 outputFile = subprocess.check_output(args, cwd=myEnv['JJOB_START_HOME'], env=myEnv, shell=False)
@@ -468,8 +489,8 @@ class JobObject(object):
             self._jobStatus = JobObject.DONE_OK
         else:
             testCases[0] = TestCase("_main_" + self.name, self.name,
-                                    (self._endTime - self._startTime).total_seconds(),
-                                    self._outFile.read(-1).decode('utf-8'), '')
+                                    (self._endTime - self._startTime).total_seconds() if self._endTime is not None else 0,
+                                    self._outFile.read(-1).decode('utf-8') if self._outFile is not None else '', '')
             if errString is not None:
                 # Internal launch error
                 if returnCode == -1:
@@ -481,15 +502,20 @@ class JobObject(object):
                     # This means the job did not start running
                     testCases[0].add_error_info("JobObject failed to launch: %s" % (errString))
                     self._jobStatus = JobObject.DONE_FAIL_LAUNCH
+                elif returnCode == -3:
+                    # This means the job had a configuration error
+                    testCases[0].add_error_info("JobObject had a configuration error: %s" % (errString))
+                    self._jobStatus = JobObject.DONE_FAIL_LAUNCH
                 else:
                     assert(False) # No other internal error codes
             else:
-                testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode), self._errFile.read(-1).decode('utf-8'))
+                testCases[0].add_failure_info("JobObject failed with return code: %d" % (returnCode),
+                                              self._errFile.read(-1).decode('utf-8') if self._errFile is not None else '')
                 self._jobStatus = JobObject.DONE_FAIL_STATUS
         # Done if returnCode
-        if self._outFile:
+        if self._outFile is not None:
             self._outFile.close() # This should automatically delete the file
-        if self._errFile:
+        if self._errFile is not None:
             self._errFile.close()
 
         self._outFile = self._errFile = None
@@ -499,12 +525,14 @@ class JobObject(object):
         if testCases[1] is not None:
             self._testSuite.add_test_case(testCases[1])
         # Merge this test suite with the ones in the history
-        for dep in self._dependence:
-            self._testSuite.merge_cases(dep.job._testSuite)
+        if returnCode <> -3:
+            for dep in self._dependence:
+                self._testSuite.merge_cases(dep.job._testSuite)
 
-        # Notify all waiters
-        for v in self._waiters.itervalues():
-            v[0].satisfyDependence(self, v[1])
+            # Notify all waiters
+            for v in self._waiters.itervalues():
+                v[0].satisfyDependence(self, v[1])
+        #endif
 
         # Release hold on directories
         if releaseDirs:
@@ -513,7 +541,29 @@ class JobObject(object):
     def _parseSandbox(self):
         inheritDirFrom = None
         for criteria in self._sandbox:
-            if criteria.startswith('inherit'):
+            if criteria == "single":
+                self._wholeMachine = True
+            elif criteria == "nosingle":
+                self._wholeMachine = False
+            elif criteria == "shareOK":
+                self._shareOK = True
+            elif criteria == "noshareOK":
+                self._shareOK = False
+            elif criteria == "writeEnv":
+                self._envProducer = True
+            elif criteria == "local":
+                self._requirePrivateRoot = -1
+            elif criteria == "nolocal":
+                self._requirePrivateRoot = -2
+                self._startInShared = True # We have no more local, so we have to start in shared
+            elif criteria == "shared":
+                self._requireSharedRoot = -1
+                if self._requirePrivateRoot == -2:
+                    self._startInShared = True
+            elif criteria == "noshared":
+                self._requireSharedRoot = -2
+                self._startInShared = False # No share, so start in private for sure
+            elif criteria.startswith('inherit'):
                 if inheritDirFrom is not None:
                     self._myLog.error("%s specifies multiple inherit parameters in sandbox" % (str(self)))
                     assert(False)
@@ -526,32 +576,22 @@ class JobObject(object):
                     self._myLog.error("%s specifies an invalid inherit target (got %s, should be between 0 and %d)" %
                                 (str(self), criteria[7:], len(self._dependence) - 1))
                     assert(False)
-            elif criteria == "createRoot":
-                self._newDirectory = True
-            elif criteria == "noCreateRoot":
-                self._newDirectory = False # Always after createRoot
-            elif criteria == "shareOK":
-                self._shareOK = True
-            elif criteria == "noShareOK":
-                self._shareOK = False
-            elif criteria == "single":
-                self._wholeMachine = True
-            elif criteria == "noSingle":
-                self._wholeMachine = False
-            elif criteria == "local":
-                self._requirePrivateRoot = -1
-            elif criteria == "noLocal":
-                self._requirePrivateRoot = -2
-                self._startInShared = True # We have no more local, so we have to start in shared
-            elif criteria == "shared":
-                self._requireSharedRoot = -1
-                if self._requirePrivateRoot == -2:
-                    self._startInShared = True
-            elif criteria == "noShared":
-                self._requireSharedRoot = -2
-                self._startInShared = False # No share, so start in private for sure
-            elif criteria == "writeEnv":
-                self._envProducer = True
+            elif criteria == "copyShared":
+                self._modeSharedRoot |= 4
+            elif criteria == "nocopyShared":
+                self._modeSharedRoot &= ~4
+            elif criteria == "emptyShared":
+                self._modeSharedRoot |= 1
+            elif criteria == "noemptyShared":
+                self._modeSharedRoot &= ~1
+            elif criteria == "copyLocal":
+                self._modePrivateRoot |= 4
+            elif criteria == "nocopyLocal":
+                self._modePrivateRoot &= ~4
+            elif criteria == "emptyLocal":
+                self._modePrivateRoot |= 1
+            elif criteria == "noemptyLocal":
+                self._modePrivateRoot &= ~1
             else:
                 self._myLog.warning("%s specifies unknown criteria in sandbox ('%s') ... ignoring." % (str(self), criteria))
         # end for over self.sandbox
@@ -572,10 +612,35 @@ class JobObject(object):
         if self._wholeMachine and (not self.jobType.isLocal):
             self._myLog.warning("%s is a remote job and specifies wholeMachine... ignoring wholeMachine as it only applies to local jobs." % (str(self)))
             self._wholeMachine = False
-        if (not self.jobType.isLocal and (self._requirePrivateRoot > -2 or not self._startInShared)):
-            self._myLog.warning("%s is a remote job and specifies it needs a private space or starts in a private space... ignoring private space requirement." % (str(self)))
-            self._requirePrivateRoot = -2
-            self._startInShared = True
+
+        if self._modePrivateRoot <> 0 and self._modePrivateRoot <> 1 and \
+           self._modePrivateRoot <> 2 and self._modePrivateRoot <> 4:
+            self._myLog.warning("%s: Invalid mode for the local root... using defaults" % (self));
+            self._modePrivateRoot = 0
+
+        if self._modeSharedRoot <> 0 and self._modeSharedRoot <> 1 and \
+           self._modeSharedRoot <> 2 and self._modeSharedRoot <> 4:
+            self._myLog.warning("%s: Invalid mode for the shared root... using defaults" % (self));
+            self._modeSharedRoot = 0
+
+        if self._modePrivateRoot == 0:
+            if self._requirePrivateRoot == -1:
+                self._modePrivateRoot = 4
+            elif self._requirePrivateRoot >= 0:
+                self._modePrivateRoot = 2
+        elif self._modePrivateRoot == 2 and self._requirePrivateRoot == -1:
+            self._myLog.warning("Forcing copy of local root since no inherit")
+            self._modePrivateRoot = 4
+
+        if self._modeSharedRoot == 0:
+            if self._requireSharedRoot  == -1:
+                self._modeSharedRoot = 4
+            elif self._requireSharedRoot >= 0:
+                self._modeSharedRoot = 2
+        elif self._modeSharedRoot == 2 and self._requireSharedRoot == -1:
+            self._myLog.warning("Forcing copy of shared root since no inherit")
+            self._modeSharedRoot = 4
+
 
     def _propagateDepthInfo(self):
         """Helper function to update the depth of parents
@@ -613,6 +678,7 @@ class JobObject(object):
             if directory is None:
                 self._myLog.error("%s could not find a proper %s directory to use" % (str(self), errorNames[0]))
             return directory
+        return directory
 
     def _createJobDirectories(self):
         """Sets up an environment for the job to
@@ -692,7 +758,7 @@ class JobObject(object):
                 self._myLog.debug("%s sole user of LUSTRE '%s'" % (str(self), self._dirs['shared']))
             else:
                 # We update the information
-                JobObject.allUsedPaths[jobDirs[1]] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1, usedInfo[2])
+                JobObject.allUsedPaths[self._dirs['shared']] = ((not self._shareOK) or usedInfo[0], usedInfo[1] + 1, usedInfo[2])
                 self._myLog.debug("%s sharing LUSTRE '%s' with %d other jobs" %
                                   (str(self), self._dirs['shared'], usedInfo[1]))
         return True
@@ -717,25 +783,44 @@ class JobObject(object):
         # All done
 
     def _getEnvironment(self):
-        env = dict()
-        env['JJOB_NAME'] = self.name
-        env['JJOB_PRIVATE_HOME'] = self._dirs['private'] if self._dirs['private'] is not None else ""
-        env['JJOB_SHARED_HOME'] = self._dirs['shared'] if self._dirs['shared'] is not None else ""
-        env['JJOB_START_HOME'] = env['JJOB_SHARED_HOME'] if self._startInShared else env['JJOB_PRIVATE_HOME']
-        env['JJOB_ENVDIR'] = JobObject.envDirectory
+        env = os.environ.copy()
+        # We do this afterwards because we will over-ride whatever is already there
+        # The env_vars trump whatever is in the environment and JJ* trump those
+        localEnv = self.env_vars
+        env.update(self.env_vars)
+        localEnv['JJOB_NAME'] = self.name
+        localEnv['JJOB_PRIVATE_HOME'] = self._dirs['private'] if self._dirs['private'] is not None else ""
+        localEnv['JJOB_SHARED_HOME'] = self._dirs['shared'] if self._dirs['shared'] is not None else ""
+        localEnv['JJOB_START_HOME'] = localEnv['JJOB_SHARED_HOME'] if self._startInShared else localEnv['JJOB_PRIVATE_HOME']
+        localEnv['JJOB_ENVDIR'] = JobObject.envDirectory
+        localEnv['JJOB_INITDIR'] = JobObject.cleanDirectory
         id = 0
         for dep in self._dependence:
             parentDirs = dep.job.getDirectories()
             dir = parentDirs['private']
             if dir is not None:
                 assert(dir <> "")
-                env['JJOB_PARENT_PRIVATE_HOME_' + str(id)] = dir
+                localEnv['JJOB_PARENT_PRIVATE_HOME_' + str(id)] = dir
             dir = parentDirs['shared']
             if dir is not None:
                 assert(dir <> "")
-                env['JJOB_PARENT_SHARED_HOME_' + str(id)] = dir
+                localEnv['JJOB_PARENT_SHARED_HOME_' + str(id)] = dir
             id = id + 1
-        self._myLog.debug("Local environment additions for %s are: %s" % (str(self), str(env)))
+
+        # Substitute environments in definitions of env_vars
+        # This allows (in particular), the users to have things
+        # like ${JJOB_NAME} in env-vars
+        substLocalEnv = {}
+        for k, v in localEnv.iteritems():
+            t = Template(v)
+            # Do in this order to make sure localEnv has precedence
+            v = t.safe_substitute(localEnv)
+            t = Template(v);
+            v = t.safe_substitute(env)
+            substLocalEnv[k] = v
+
+        self._myLog.debug("Local environment additions/overrides for %s are: %s" % (str(self), str(substLocalEnv)))
+        env.update(substLocalEnv)
         return env
 
     def __repr__(self):
@@ -774,7 +859,6 @@ class LocalJobObject(JobObject):
 
             # Set up the environment
             myEnv = origEnv = self._getEnvironment()
-            myEnv.update(os.environ)
             myEnv['PYTHONIOENCODING'] = 'utf-8'
 
             # Create files for the error and output streams
@@ -820,7 +904,6 @@ class LocalJobObject(JobObject):
             cmdLine = cmdLine.substitute(origEnv)
             args = shlex.split(cmdLine)
             self._myLog.debug("%s will run epilogue with: %s" % (str(self), str(args)))
-            myEnv.update(os.environ)
             myEnv['PYTHONIOENCODING'] = 'utf-8'
             try:
                 subprocess.check_call(args, cwd=myEnv['JJOB_START_HOME'],
@@ -872,6 +955,11 @@ class LocalJobObject(JobObject):
 class TorqueJobObject(JobObject):
     """A job that executes using the Torque job scheduler"""
 
+    def __init__(self, inputDict, jobType, dependenceCount):
+        super(TorqueJobObject, self).__init__(inputDict, jobType, dependenceCount)
+        self._prologueFile = None
+        self._epilogueFile = None
+
     def execute(self):
         """Executes the job using Torque"""
         if self._recomputeStatus:
@@ -904,8 +992,23 @@ class TorqueJobObject(JobObject):
 
             # Set up the environment
             myEnv = origEnv = self._getEnvironment()
-            myEnv.update(os.environ)
             myEnv['PYTHONIOENCODING'] = 'utf-8'
+
+            # TODO: Maybe move this to the building of the job (but then I don't yet support
+            # erroring out of the initializer)
+            if len(myEnv['JJOB_SHARED_HOME']) == 0 or \
+               len(myEnv['JJOB_PRIVATE_HOME']) <> 0 or \
+               myEnv['JJOB_START_HOME'] <> myEnv['JJOB_SHARED_HOME']:
+                # Wrong configuration for the job
+                self._myLog.info("Remote job's working directories are not configured properly:\n"
+                                 "It should have no local home and start in its shared directory. Found values:\n"
+                                 "\tSHARED_HOME: %s\n"
+                                 "\tPRIVATE_HOME: %s\n"
+                                 "\tSTART_HOME: %s\n" % (myEnv['JJOB_SHARED_HOME'], myEnv['JJOB_PRIVATE_HOME'], myEnv['JJOB_START_HOME']))
+                self.signalJobDone(-2, True, "Invalid directories for remote job")
+                self._jobStatus = JobObject.DONE_FAIL_LAUNCH
+                return self._jobStatus
+            # All directories are OK for this remote job
 
             # We need to create the arguments for Qsub
             # Get the string of required resources
@@ -939,14 +1042,35 @@ class TorqueJobObject(JobObject):
                                     % (self))
             resourceString = resourceStringNew
 
+            # Prologue and epilogue scripts need to have certain permissions
+            # to run properly so we will create a new file with the proper
+            # permission
             if len(self.jobType.prologue_cmd):
                 cmdLine = Template(self.jobType.prologue_cmd)
                 cmdLine = cmdLine.substitute(origEnv)
-                resourceString = resourceString + ",prologue=%s" % (cmdLine)
+                self._prologueFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="prologue", prefix="jjob_" + self.name + "_",
+                                                                 dir=myEnv['JJOB_SHARED_HOME'], delete=False)
+                # Stupid Torque does not pass environment variables to the prologue/epilogue scripts so
+                # we do one level substitutions (ie: just in the prologue and epilogue files)
+                with open(cmdLine, "r") as tfile:
+                    for line in tfile:
+                        ttemplate = Template(line)
+                        self._prologueFile.write(ttemplate.safe_substitute(origEnv))
+                self._prologueFile.close()
+                os.chmod(self._prologueFile.name, S_IRUSR | S_IWUSR | S_IXUSR)
+                resourceString = resourceString + ",prologue=%s" % (self._prologueFile.name)
             if len(self.jobType.epilogue_cmd):
                 cmdLine = Template(self.jobType.epilogue_cmd)
                 cmdLine = cmdLine.substitute(origEnv)
-                resourceString = resourceString + ",epilogue=%s" % (cmdLine)
+                self._epilogueFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="epilogue", prefix="jjob_" + self.name + "_",
+                                                                 dir=myEnv['JJOB_SHARED_HOME'], delete=False)
+                with open(cmdLine, "r") as tfile:
+                    for line in tfile:
+                        ttemplate = Template(line)
+                        self._epilogueFile.write(ttemplate.safe_substitute(origEnv))
+                self._epilogueFile.close()
+                os.chmod(self._epilogueFile.name, S_IRUSR | S_IWUSR | S_IXUSR)
+                resourceString = resourceString + ",epilogue=%s" % (self._epilogueFile.name)
 
             # We deal with the walltime resource requirement because that's
             # how we add the timeout requirement
@@ -1023,7 +1147,7 @@ class TorqueJobObject(JobObject):
             has been terminated) and False if it is still running
         """
         stateCompleteMatch = re.compile("job_state = ([CEHQRTWS])$", re.MULTILINE)
-        statusCheckMatch = re.compile("exit_status = ([0-9]+)$", re.MULTILINE)
+        statusCheckMatch = re.compile("exit_status = ([-0-9]+)$", re.MULTILINE)
         timeCheckMatch = re.compile("resources_used.walltime = ([0-9:]+)$", re.MULTILINE)
 
         pollArgs = ['/usr/local/bin/qstat', '-f', self._jobNumber]
@@ -1074,3 +1198,12 @@ class TorqueJobObject(JobObject):
                               (str(self), curStatus,
                                (now - self._startTime).seconds))
         return False
+
+    def signalJobDone(self, returnCode, releaseDirs, errString = None):
+        super(TorqueJobObject, self).signalJobDone(returnCode, releaseDirs, errString)
+        if self._prologueFile is not None:
+            os.remove(self._prologueFile.name)
+        if self._epilogueFile is not None:
+            os.remove(self._epilogueFile.name)
+
+        self._prologueFile = self._epilogueFile = None

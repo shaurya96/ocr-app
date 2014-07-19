@@ -156,7 +156,8 @@ def checkJob(inputDict):
     checkStruct = {'name': "", 'depends': (),
                    'jobtype': "", 'run-args': "",
                    'param-args': "",
-                   'sandbox': (), 'timeout': int(0)}
+                   'sandbox': (), 'timeout': int(0),
+                   'env-vars': {} }
     checkPresence = ('name', 'depends', 'jobtype',
                      'run-args')
     return checkDict(inputDict, "JobObject", checkStruct, checkPresence)
@@ -165,7 +166,9 @@ def checkJob(inputDict):
 def checkJobType(inputDict):
     checkStruct = {'name': "", 'keywords': (), 'isLocal': False,
                    'run-cmd': "", 'param-cmd': "",
-                   'sandbox': (), 'timeout': int(0)}
+                   'epilogue-cmd': "", 'prologue-cmd': "",
+                   'sandbox': (), 'timeout': int(0),
+                   'env-vars': {}}
     checkPresence = ('name', 'keywords', 'isLocal', 'run-cmd', 'param-cmd',
                      'sandbox')
     return checkDict(inputDict, "JobObject type", checkStruct, checkPresence)
@@ -322,18 +325,16 @@ def mainLoop():
                 if allReadyJobs[i][1].getIsWholeMachine():
                     myLog.debug("%s requires the entire machine, not launching others" % (str(allReadyJobs[i][1])))
                     needWholeMachine = True
-                allReadyJobs.pop(i)
-                effectiveEnd -= 1
             elif returnedStatus > JobObject.DONE_OK:
                 # This means the job did not launch properly
                 myLog.warning("%s failed to launch properly... it will be reported as a failure" % (str(allReadyJobs[i][1])))
                 if allReadyJobs[i][1].getIsTerminalJob():
                     allTerminalJobs.append(allReadyJobs[i][1])
-                allReadyJobs.pop(i)
             else:
                 myLog.error("Status returned by execute not allowed for %s (got %d)" % (str(allReadyJobs[i][1]), returnedStatus))
                 # I don't really know what to do here. It should never happen
-                allReadyJobs.pop(i)
+            allReadyJobs.pop(i)
+            effectiveEnd -= 1
 
         # At this stage, we have launched all jobs that
         # could be launched. We will sleep before resuming the
@@ -426,16 +427,22 @@ def main(argv=None):
                                             for Torque
         - sandbox:     (tuple of strings) See below for an explanation of the sandbox parameters
     It can also optionally specify:
-        - timeout:     (int) Number of seconds before a job is killed. If non specified or 0,
-                       the job will never timeout
-        - prologue-cmd (string) A script to be run right before the job. This is mostly
-                       useful for remote jobs. On success, this script should return 0.
-                       The system will abort prologue scripts after 5 minutes.
-                       Note that this script runs ONCE even for remote jobs taking up
-                       multiple machines. It will run on the "first" remote node
-        - epilogue-cmd (string) Same as 'prologue-cmd' except it executes after the job
-                       runs. Note that this can be used for cleanup as it will run
-                       even in the case of a failure.
+        - timeout:      (int) Number of seconds before a job is killed. If non specified or 0,
+                        the job will never timeout
+        - prologue-cmd: (string) A script to be run right before the job. This is mostly
+                        useful for remote jobs. On success, this script should return 0.
+                        The system will abort prologue scripts after 5 minutes.
+                        Note that this script runs ONCE even for remote jobs taking up
+                        multiple machines. It will run on the "first" remote node. Note that
+                        prologue and epilogue scripts run in an environment with NO environment
+                        variables defined. For convenience, the system will parse the
+                        prologue and epilogue script and statically replace all instances
+                        of environment variables. It does not do this recursively.
+        - epilogue-cmd: (string) Same as 'prologue-cmd' except it executes after the job
+                        runs. Note that this can be used for cleanup as it will run
+                        even in the case of a failure.
+        - env-vars:     (dict) A dictionary of additional environment variables for the
+                        job.
 
     Each job must specify the following arguments:
         - name:        (string) Name of the job (must be unique)
@@ -452,44 +459,51 @@ def main(argv=None):
                        and over-rides all other parameters.
         - timeout:     (int) Number of seconds before this job is killed. It overrides anything
                        specified by the job type
+        - env-vars:    (dict) A dictionary of additional environment variables for the job. Thes
+                       will be added to the ones defined in the job-type; in case of duplicates, th
+                       job environment variables will override the ones from the job-type
 
     Explanation of the parameters of the 'sandbox' argument:
         - The 'sandbox' argument determines the directories this job will be given to run in
-          and whether or not it "inherits" data from some of its parent jobs. The valid strings are:
+          and whether or not it "inherits" data from some of its parent jobs. In the list below,
+          a [no] prefix indicates that the job's sandbox parameters can override the job type's
+          sandbox parameter. The valid strings are:
+            ## Job execution characteristics: Defaults: nosingle, noshareOK ##
+            - [no]single:   Specifies whether the job requires the entire machine to run. This only applies to
+                            local jobs as the requirements for remote jobs are returned through param-cmd.
+            - [no]shareOK:  If inheriting from a parent, specifies whether it is OK to run other jobs in that
+                            same directory.
+            - writeEnv:     Can only be specified in the job type's sandbox.
+                            Will be prioritized over other jobs and will run
+                            alone to update the environment.
+            ## Execution directories: Defaults: local ##
+            - [no]local:    Specifies whether this job requires a local home directory (non-shared over LUSTRE).
+                            If specified before 'shared', the initial directory for the job will be the
+                            local one. The environment variable JJOB_PRIVATE_HOME will be set to this
+                            directory as well as JJOB_START_HOME if this is the starting directory.
+            - [no]shared:   Specifies whether this job requires a shared home directory (shared over LUSTRE).
+                            Same comments as for 'local'. Sets JJOB_SHARED_HOME.
             - inheritX:     Where X is an integer from 0 to the number of dependences minus 1. This specifies
                             which working directory from a parent this job should inherit. For example, jobs
                             that run regression tests may want to inherit from the job that built the executables.
                             If this option is not specified, the job will get a copy of the initial check-out. This
                             option can only be specified in the job's sandbox description.
-            - createRoot:   Specifies whether this job should be given a new directory (a copy from whomever it
-                            inherits from). Note that this parameter has no impact if inheritX is not specified
-                            as the job is always given a copy when inheriting from the initial check-out.
-            - noCreateRoot: Can only be specified in a job's sandbox list to over-ride a 'createRoot' in a job type's
-                            sandbox list.
-            - shareOK:      If inheriting from a parent, specifies whether it is OK to run other jobs in that
-                            same directory.
-            - noShareOK:    Can only be specified in a job's sandbox list to over-ride a 'shareOK' in the job type's
-                            sandbox list.
-            - single:       Specifies whether the job requires the entire machine to run. This only applies to
-                            local jobs as the requirements for remote jobs are returned through param-cmd.
-            - noSingle:     Can only be specified in a job's sandbox list to over-ride a 'single' in the job type's
-                            sandbox list.
-            - local:        Specifies whether this job requires a local home directory (non-shared over LUSTRE).
-                            If specified before 'shared', the initial directory for the job will be the
-                            local one. The environment variable JJOB_PRIVATE_HOME will be set to this
-                            directory as well as JJOB_START_HOME if this is the starting directory.
-            - noLocal:      Can only be specified in a job's sandbox list to over-ride a 'local' in the job type's
-                            sandbox list.
-            - shared:       Specifies whether this job requires a shared home directory (shared over LUSTRE).
-                            Same comments as for 'local'. Sets JJOB_SHARED_HOME.
-            - noShared:     Like 'noLocal' but for 'shared'
-            - writeEnv:     Can only be specified in the job type's sandbox.
-                            Will be prioritized over other jobs and will run
-                            alone to update the environment.
+            ## Execution directories behavior: Defaults: (none) ##
+            - [no]copyShared:  If specified, the job will be given a copy of its 'shared' home. This is relevant
+                               only when inheritX is specified as, in the default case, a copy of the initial
+                               checkout is given
+            - [no]emptyShared: If specified, the job will be given an empty 'shared' home.
+            - [no]copyLocal:   Same as [no]copyShared for the private home
+            - [no]emptyLocal:  Same as [no]emptyShared for the private home
+
 
     Environment variables available to the jobs:
         - JJOB_NAME                   Name of the job running
-        - JJOB_ENVDIR                 Path to the environment directory (always shared)
+        - JJOB_INITDIR                Directory containing the initial checkout. You should not
+                                      modify anything in this (this is the "golden" copy for the
+                                      tests). This is always local.
+        - JJOB_ENVDIR                 Path to the environment directory (always shared). You should
+                                      not modify this unless you are a writeEnv job
         - JJOB_PRIVATE_HOME           Local (non LUSTRE) directory for this job
                                       if 'local' is specified
         - JJOB_SHARED_HOME            Shared (LUSTRE) directory for this job if
@@ -636,6 +650,7 @@ def main(argv=None):
         # and create the jobs
         # First step: check the keywords
         toRemoveKeys = []
+        sideJobs = dict() # Jobs that don't match keyword restrictions. May be re-added due to dependences
         for k, v in tempJobs.iteritems():
             jobType = allJobTypes.get(v['jobtype'])
             if jobType is None:
@@ -644,6 +659,7 @@ def main(argv=None):
                 myLog.info("Ignoring job %s due to keyword restrictions" % (v['name']))
                 toRemoveKeys.append(k)
         for k in toRemoveKeys:
+            sideJobs[k] = tempJobs[k]
             del tempJobs[k]
 
         for k, v in tempJobs.iteritems():
@@ -656,20 +672,56 @@ def main(argv=None):
                 allRemainingJobs[k] = TorqueJobObject(v, jobType, len(v['depends']))
 
         # Do another loop to set up the dependences properly
-        for k, v in tempJobs.iteritems():
-            if len(v['depends']):
-                waitingJob = allRemainingJobs[k]
-                for dep in v['depends']:
-                    signalingJob = allRemainingJobs[dep]
-                    slot = waitingJob.addDependence(signalingJob)
-                    signalingJob.addWaiter(waitingJob, slot)
-        # Got all dependence information
+        changedJobs = True
+        ttempJobs = dict()
+        while changedJobs:
+            changedJobs = False
+            toRemoveKeys = []
+            for k, v in tempJobs.iteritems():
+                if len(v['depends']):
+                    waitingJob = allRemainingJobs[k]
+                    for dep in v['depends']:
+                        signalingJob = allRemainingJobs.get(dep, None)
+                        if signalingJob is None:
+                            tjob = sideJobs.get(dep, None)
+                            if tjob is None:
+                                myLog.error("<JobObject '%s'> has unknown dependence '%s'" % (k, dep))
+                                waitingJob.signalJobDone(-3, False, "<JobObject '%s'> has unknown dependence '%s'" % (k, dep))
+                                toRemoveKeys.append(k)
+                                changedJobs = True
+                            else:
+                                ttempJobs[dep] = tjob
+                                jobType = allJobTypes.get(tjob['jobtype'])
+                                assert(jobType is not None)
+                                if jobType.isLocal:
+                                    signalingJob = allRemainingJobs[dep] = \
+                                                   LocalJobObject(tjob, jobType, len(tjob['depends']))
+                                else:
+                                    signalingJob = allRemainingJobs[dep] = \
+                                                   TorqueJobObject(tjob, jobType, len(tjob['depends']))
+                                changedJobs = True
+                                myLog.info("Re-adding job %s due to dependence by %s" % (signalingJob, waitingJob))
+
+                        if signalingJob is not None:
+                            slot = waitingJob.addDependence(signalingJob)
+                            signalingJob.addWaiter(waitingJob, slot)
+                        # End of signalingJob is None
+                    # End of dep in v['depends']
+                # end of len(v['depends'])
+            # Got all dependence information
+            for k in toRemoveKeys:
+                del allRemainingJobs[k]
+            tempJobs = ttempJobs.copy()
+            ttempJobs.clear()
+        # End of while loop
+        del sideJobs
+
         # Check if we missed some dependence
         toRemoveKeys = []
         for k, v in allRemainingJobs.iteritems():
             if v.getStatus() == JobObject.UNCONFIGURED_JOB:
-                myLog.warning("%s has missing dependences" % (str(v)))
-                v.signalJobDone(-2)
+                myLog.error("<JobObject '%s'> has missing dependences" % (k))
+                v.signalJobDone(-3, False, "<JobObject '%s'> has missing dependences" % (k))
                 toRemoveKeys.append(k)
         for k in toRemoveKeys:
             del allRemainingJobs[k]
@@ -706,8 +758,11 @@ def main(argv=None):
                (totalJobCount, str(startTime)))
     mainLoop()
     endTime = datetime.now()
-    myLog.info("---- Finished jobs (took %d seconds, %d terminal jobs; %d could not run), now cleaning up ----" %
-               ((endTime - startTime).seconds, len(allTerminalJobs), countBlockedJobs))
+    totalFailures = 0
+    for v in allUsedPaths.itervalues():
+        totalFailures += v[2]
+    myLog.info("---- Finished jobs (took %d seconds: %d terminal jobs; %d blocked jobs; %d failures), now cleaning up ----" %
+               ((endTime - startTime).seconds, len(allTerminalJobs), countBlockedJobs, totalFailures))
 
     # Output results
     allTestSuites = [job.getTestSuite() for job in allTerminalJobs]
