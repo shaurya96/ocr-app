@@ -792,6 +792,9 @@ def main(argv=None):
             shutil.rmtree(k)
 
     myLog.info("---- Done ----")
+    if totalFailures > 0 or countBlockedJobs > 0:
+        return 1
+    return 0
 
 # Starts the program
 if __name__ == '__main__':

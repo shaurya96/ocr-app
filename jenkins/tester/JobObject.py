@@ -782,7 +782,7 @@ class JobObject(object):
             JobObject.allUsedPaths[self._dirs['shared']] = (False, usedInfo[1] - 1, usedInfo[2] + failureCount)
         # All done
 
-    def _getEnvironment(self):
+    def _getEnvironment(self, ignorePbs = False):
         env = os.environ.copy()
         # We do this afterwards because we will over-ride whatever is already there
         # The env_vars trump whatever is in the environment and JJ* trump those
@@ -821,6 +821,14 @@ class JobObject(object):
 
         self._myLog.debug("Local environment additions/overrides for %s are: %s" % (str(self), str(substLocalEnv)))
         env.update(substLocalEnv)
+        if ignorePbs:
+            # We remove anything that starts with PBS_
+            keysToRemove = []
+            for k, v in env.iteritems():
+                if k.startswith('PBS_'):
+                    keysToRemove.append(k)
+            for k in keysToRemove:
+                del env[k]
         return env
 
     def __repr__(self):
@@ -858,7 +866,7 @@ class LocalJobObject(JobObject):
             self._copyJobDirectories()
 
             # Set up the environment
-            myEnv = origEnv = self._getEnvironment()
+            myEnv = self._getEnvironment()
             myEnv['PYTHONIOENCODING'] = 'utf-8'
 
             # Create files for the error and output streams
@@ -871,7 +879,7 @@ class LocalJobObject(JobObject):
             # Run the prologue script
             if len(self.jobType.prologue_cmd):
                 cmdLine = Template(self.jobType.prologue_cmd)
-                cmdLine = cmdLine.substitute(origEnv)
+                cmdLine = cmdLine.substitute(myEnv)
                 args = shlex.split(cmdLine)
                 self._myLog.debug("%s will run prologue with: %s" % (str(self), str(args)))
                 try:
@@ -882,7 +890,7 @@ class LocalJobObject(JobObject):
             # Now go and run the executable
             # Form the command line
             cmdLine = Template(self.jobType.run_cmd + " " + self.run_args)
-            cmdLine = cmdLine.substitute(origEnv) # Allow user to use JJOB_* macros
+            cmdLine = cmdLine.substitute(myEnv) # Allow user to use JJOB_* macros
             args = shlex.split(cmdLine)
 
             self._myLog.debug("%s will execute with: %s" % (str(self), str(args)))
@@ -901,7 +909,7 @@ class LocalJobObject(JobObject):
         if len(self.jobType.epilogue_cmd):
             myEnv = self._getEnvironment()
             cmdLine = Template(self.jobType.epilogue_cmd)
-            cmdLine = cmdLine.substitute(origEnv)
+            cmdLine = cmdLine.substitute(myEnv)
             args = shlex.split(cmdLine)
             self._myLog.debug("%s will run epilogue with: %s" % (str(self), str(args)))
             myEnv['PYTHONIOENCODING'] = 'utf-8'
@@ -991,8 +999,9 @@ class TorqueJobObject(JobObject):
             self._copyJobDirectories()
 
             # Set up the environment
-            myEnv = origEnv = self._getEnvironment()
+            myEnv = self._getEnvironment()
             myEnv['PYTHONIOENCODING'] = 'utf-8'
+            pbsFreeEnv = self._getEnvironment(True)
 
             # TODO: Maybe move this to the building of the job (but then I don't yet support
             # erroring out of the initializer)
@@ -1013,7 +1022,7 @@ class TorqueJobObject(JobObject):
             # We need to create the arguments for Qsub
             # Get the string of required resources
             cmdLine = Template(self.jobType.param_cmd + " resources " + self.param_args)
-            cmdLine = cmdLine.substitute(origEnv)
+            cmdLine = cmdLine.substitute(myEnv)
             args = shlex.split(cmdLine)
             self._myLog.debug("%s getting resources for Torque job with command '%s'" % (str(self), str(args)))
             resourceString = None
@@ -1047,7 +1056,7 @@ class TorqueJobObject(JobObject):
             # permission
             if len(self.jobType.prologue_cmd):
                 cmdLine = Template(self.jobType.prologue_cmd)
-                cmdLine = cmdLine.substitute(origEnv)
+                cmdLine = cmdLine.substitute(myEnv)
                 self._prologueFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="prologue", prefix="jjob_" + self.name + "_",
                                                                  dir=myEnv['JJOB_SHARED_HOME'], delete=False)
                 # Stupid Torque does not pass environment variables to the prologue/epilogue scripts so
@@ -1055,19 +1064,19 @@ class TorqueJobObject(JobObject):
                 with open(cmdLine, "r") as tfile:
                     for line in tfile:
                         ttemplate = Template(line)
-                        self._prologueFile.write(ttemplate.safe_substitute(origEnv))
+                        self._prologueFile.write(ttemplate.safe_substitute(pbsFreeEnv))
                 self._prologueFile.close()
                 os.chmod(self._prologueFile.name, S_IRUSR | S_IWUSR | S_IXUSR)
                 resourceString = resourceString + ",prologue=%s" % (self._prologueFile.name)
             if len(self.jobType.epilogue_cmd):
                 cmdLine = Template(self.jobType.epilogue_cmd)
-                cmdLine = cmdLine.substitute(origEnv)
+                cmdLine = cmdLine.substitute(myEnv)
                 self._epilogueFile = tempfile.NamedTemporaryFile(mode="w+b", suffix="epilogue", prefix="jjob_" + self.name + "_",
                                                                  dir=myEnv['JJOB_SHARED_HOME'], delete=False)
                 with open(cmdLine, "r") as tfile:
                     for line in tfile:
                         ttemplate = Template(line)
-                        self._epilogueFile.write(ttemplate.safe_substitute(origEnv))
+                        self._epilogueFile.write(ttemplate.safe_substitute(pbsFreeEnv))
                 self._epilogueFile.close()
                 os.chmod(self._epilogueFile.name, S_IRUSR | S_IWUSR | S_IXUSR)
                 resourceString = resourceString + ",epilogue=%s" % (self._epilogueFile.name)
