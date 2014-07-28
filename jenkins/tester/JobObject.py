@@ -1143,7 +1143,7 @@ class TorqueJobObject(JobObject):
 
             # Here we have the job number
             self._jobNumber = self._jobNumber.strip()
-            self._myLog.debug("%s was added to the Torque job queue with ID '%s'" % (str(self), self._jobNumber))
+            self._myLog.info("%s was added to the Torque job queue with ID '%s'" % (str(self), self._jobNumber))
 
             return JobObject.RUNNING_REMOTE
         else:
