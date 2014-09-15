@@ -596,7 +596,7 @@ def main(argv=None):
             else:
                 raise Usage("Unhandled option")
         if args is not None and len(args) > 0:
-            raise Usage("Extraneous arguments")
+            raise Usage("Extraneous arguments %s" % (args))
 
         # Now check if we have everything we need
         # TODO: Add permission checks maybe
