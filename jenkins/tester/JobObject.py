@@ -786,8 +786,13 @@ class JobObject(object):
         env = os.environ.copy()
         # We do this afterwards because we will over-ride whatever is already there
         # The env_vars trump whatever is in the environment and JJ* trump those
-        localEnv = self.env_vars
-        env.update(self.env_vars)
+        localEnv = {}
+        # Allow the update of default variables like PATH
+        for k, v in self.env_vars.iteritems():
+            t = Template(v)
+            v = t.safe_substitute(env)
+            localEnv[k] = v
+
         localEnv['JJOB_NAME'] = self.name
         localEnv['JJOB_PRIVATE_HOME'] = self._dirs['private'] if self._dirs['private'] is not None else ""
         localEnv['JJOB_SHARED_HOME'] = self._dirs['shared'] if self._dirs['shared'] is not None else ""
